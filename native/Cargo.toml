@@ -1,0 +1,20 @@
+[package]
+name = "solar-bridge"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Solar native bridge — pure functions over a live SpacetimeDB DbConnection (cache reads, oneway reducer calls, world subscriptions). Owns no connection itself; the Stomzy native bridge (minestom_stdb_bridge) passes it the one live connection it already holds (see libraries/solar/docs/ROADMAP.md S1: reuse, don't duplicate)."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+# Must match the host bridge's SpacetimeDB SDK version exactly (spacetime/cold,
+# and platforms/stomzy/spacetime/{native,stdb}) — a mismatched client silently
+# drops live TransactionUpdates. See the project's spacetimedb-version-lock note.
+spacetimedb-sdk = "=2.8.1"
+
+# The generated Rust client for spacetime/coldmain (table/reducer bindings). Same crate
+# platforms/stomzy/spacetime/native depends on — solar-bridge reads/writes through it, it
+# does not generate or own a second copy.
+minestom-stdb = { path = "../../../platforms/stomzy/spacetime/stdb", default-features = false, features = ["client"] }
