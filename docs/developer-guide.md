@@ -14,4 +14,4 @@
 ---
 
 ## 📖 Canonical Specifications
-* **[`.bible/03-persistence-and-storage`](file:///C:/Users/trapaholics/Documents/GitHub/.bible/03-persistence-and-storage)**
+* **[`.bible/03-persistence-and-storage`](.bible/03-persistence-and-storage)**
