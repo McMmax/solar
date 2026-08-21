@@ -8,4 +8,4 @@ description = "Solar SpacetimeDB world-store schema — per-chunk world tables s
 [dependencies]
 # Must match the host module's SpacetimeDB version exactly — the #[table] macro
 # emits version-specific descriptors that the module links into its WASM binary.
-spacetimedb = "=2.8.1"
+spacetimedb = "=2.8.2"
