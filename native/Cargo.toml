@@ -17,4 +17,4 @@ spacetimedb-sdk = "=2.8.2"
 # The generated Rust client for spacetime/coldmain (table/reducer bindings). Same crate
 # platforms/stomzy/spacetime/native depends on — solar-bridge reads/writes through it, it
 # does not generate or own a second copy.
-minestom-stdb = { path = "../../../stomzy/spacetime/stdb", default-features = false, features = ["client"] }
+minestom-stdb = { path = "../../../platforms/stomzy/spacetime/stdb", default-features = false, features = ["client"] }
