@@ -117,6 +117,17 @@ impl SolarChunkFrame {
     pub fn total_pending_edits(&self) -> usize {
         self.ordered_patches.iter().map(|p| p.edits.len()).sum()
     }
+
+    /// Computes approximate byte footprint in native memory.
+    pub fn approximate_byte_size(&self) -> usize {
+        let mut size = std::mem::size_of::<Self>() + self.base_data.capacity();
+        size += self.ordered_patches.capacity() * std::mem::size_of::<SolarChunkPatchFrame>();
+        for p in &self.ordered_patches {
+            size += p.edits.capacity() * std::mem::size_of::<SolarBlockEdit>();
+            size += p.actor.capacity();
+        }
+        size
+    }
 }
 
 /// Pure deterministic reconstruction of a `SolarChunkFrame` from raw table entities.
@@ -217,124 +228,13 @@ pub fn reconstruct_chunk_frame(
     }
 }
 
-use std::collections::HashMap;
+pub mod cache;
+pub mod codec;
+pub mod interest;
 
-/// Native subscription session and chunk frame cache for attached worlds.
-///
-/// Features:
-/// - Explicit world attach/detach lifecycle with clean subscription management.
-/// - Invalidation of cached `SolarChunkFrame` entries when `SolarChunkHead` revision advances.
-/// - Cache hit path: avoids patch sorting and vector reconstruction when head revision matches.
-/// - Cleanup guarantee: detaching a world drops all cached frames, revisions, and buffers for that world key.
-#[derive(Default, Debug)]
-pub struct SolarNativeCache {
-    attached_worlds: HashMap<u64, SolarWorldCacheState>,
-}
-
-#[derive(Default, Debug)]
-pub struct SolarWorldCacheState {
-    pub world_key: u64,
-    /// Cached reconstructed chunk frames keyed by packed `u128 chunk_key`.
-    pub chunk_frames: HashMap<u128, SolarChunkFrame>,
-    /// Last observed head revisions keyed by packed `u128 chunk_key`.
-    pub head_revisions: HashMap<u128, u64>,
-}
-
-impl SolarNativeCache {
-    /// Constructs a new empty native cache.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Attaches a world to the native cache.
-    /// Returns `true` if attached newly, `false` if already attached.
-    pub fn attach_world(&mut self, world_key: u64) -> bool {
-        if self.attached_worlds.contains_key(&world_key) {
-            false
-        } else {
-            self.attached_worlds.insert(
-                world_key,
-                SolarWorldCacheState {
-                    world_key,
-                    chunk_frames: HashMap::new(),
-                    head_revisions: HashMap::new(),
-                },
-            );
-            true
-        }
-    }
-
-    /// Detaches a world and immediately frees all cached chunk frames and revision indices.
-    /// Returns `true` if world was attached, `false` otherwise.
-    pub fn detach_world(&mut self, world_key: u64) -> bool {
-        self.attached_worlds.remove(&world_key).is_some()
-    }
-
-    /// Returns `true` if the specified world is currently attached.
-    pub fn is_world_attached(&self, world_key: u64) -> bool {
-        self.attached_worlds.contains_key(&world_key)
-    }
-
-    /// Returns the number of cached frames for a given world.
-    pub fn cached_frame_count(&self, world_key: u64) -> usize {
-        self.attached_worlds
-            .get(&world_key)
-            .map(|s| s.chunk_frames.len())
-            .unwrap_or(0)
-    }
-
-    /// Notifies cache of a chunk head update event (e.g. from SpacetimeDB table subscription).
-    /// If the head revision has advanced, any cached frame for this chunk is invalidated.
-    pub fn on_chunk_head_updated(&mut self, head: &SolarChunkHead) {
-        if let Some(state) = self.attached_worlds.get_mut(&head.world_key) {
-            let prev = state.head_revisions.insert(head.chunk_key, head.applied_revision);
-            if let Some(prev_rev) = prev {
-                if prev_rev != head.applied_revision {
-                    state.chunk_frames.remove(&head.chunk_key);
-                }
-            }
-        }
-    }
-
-    /// Returns the cached chunk frame if available and matching head revision,
-    /// otherwise reconstructs it, caches it, and returns it.
-    pub fn get_or_reconstruct(
-        &mut self,
-        chunk_key: u128,
-        base: Option<&SolarChunkBase>,
-        head: Option<&SolarChunkHead>,
-        patches: &[SolarChunkPatch],
-    ) -> Result<SolarChunkFrame, SolarReadError> {
-        let (world_key, _, _) = unpack_chunk_key(chunk_key);
-        let state = self
-            .attached_worlds
-            .get_mut(&world_key)
-            .ok_or(SolarReadError::NotFound { chunk_key })?;
-
-        if let Some(h) = head {
-            if let Some(cached) = state.chunk_frames.get(&chunk_key) {
-                if cached.applied_revision == h.applied_revision {
-                    return Ok(cached.clone());
-                }
-            }
-        }
-
-        let frame = reconstruct_chunk_frame(chunk_key, base, head, patches)?;
-        state.chunk_frames.insert(chunk_key, frame.clone());
-        state.head_revisions.insert(chunk_key, frame.applied_revision);
-        Ok(frame)
-    }
-
-    /// Explicitly invalidates a cached chunk frame by packed `chunk_key`.
-    pub fn invalidate_chunk(&mut self, chunk_key: u128) -> bool {
-        let (world_key, _, _) = unpack_chunk_key(chunk_key);
-        if let Some(state) = self.attached_worlds.get_mut(&world_key) {
-            state.chunk_frames.remove(&chunk_key).is_some()
-        } else {
-            false
-        }
-    }
-}
+pub use cache::*;
+pub use codec::*;
+pub use interest::*;
 
 /// Subscribes to one world's Solar v1 tables (`solar_world`, `solar_chunk_base`,
 /// `solar_chunk_head`, `solar_chunk_patch`, `solar_compaction_request`) by `world_key`.
@@ -615,210 +515,316 @@ mod tests {
         assert_eq!(res, Err(SolarReadError::EmptyBaseData { chunk_key }));
     }
 
-    #[test]
-    fn test_native_cache_world_attach_detach_lifecycle() {
-        let mut cache = SolarNativeCache::new();
-        assert!(!cache.is_world_attached(100));
-
-        // Attach world 100
-        assert!(cache.attach_world(100));
-        assert!(cache.is_world_attached(100));
-        assert_eq!(cache.cached_frame_count(100), 0);
-
-        // Duplicate attach -> returns false
-        assert!(!cache.attach_world(100));
-
-        // Detach world 100
-        assert!(cache.detach_world(100));
-        assert!(!cache.is_world_attached(100));
-
-        // Duplicate detach -> returns false
-        assert!(!cache.detach_world(100));
-    }
+    // -----------------------------------------------------------------------
+    // Phase 4 Tests: Bounded Cache, LRU Eviction, Pinning, Tiles, Priority
+    // -----------------------------------------------------------------------
 
     #[test]
-    fn test_native_cache_invalidation_on_head_revision_advance() {
-        let mut cache = SolarNativeCache::new();
-        cache.attach_world(10);
-
-        let chunk_key = pack_chunk_key(10, 0, 0);
-        let base = SolarChunkBase {
-            chunk_key,
-            world_key: 10,
-            chunk_x: 0,
-            chunk_z: 0,
-            data: vec![0x10, 0x20],
-            base_revision: 0,
-            created_at: Timestamp::from_micros_since_unix_epoch(1),
-            updated_at: Timestamp::from_micros_since_unix_epoch(1),
+    fn test_cache_limits_and_lru_eviction_order() {
+        // Cache configured to hold at most 3 frames per world
+        let config = SolarCacheConfig {
+            max_world_bytes: 1024 * 1024,
+            max_world_frames: 3,
+            max_global_bytes: 10 * 1024 * 1024,
+            max_global_frames: 10,
         };
-        let mut head = SolarChunkHead {
-            chunk_key,
-            world_key: 10,
-            chunk_x: 0,
-            chunk_z: 0,
-            applied_revision: 1,
-            base_revision: 0,
-            patch_count: 1,
-            updated_at: Timestamp::from_micros_since_unix_epoch(10),
-            last_actor: "actor_1".to_string(),
-        };
-        let mut patches = vec![SolarChunkPatch {
-            id: 1,
-            chunk_key,
-            world_key: 10,
-            chunk_x: 0,
-            chunk_z: 0,
-            revision: 1,
-            edits: vec![SolarBlockEdit::new(0, 64, 0, 1)],
-            actor: "actor_1".to_string(),
-            created_at: Timestamp::from_micros_since_unix_epoch(10),
-        }];
-
-        // Reconstruct and cache at revision 1
-        let frame_v1 = cache.get_or_reconstruct(chunk_key, Some(&base), Some(&head), &patches).unwrap();
-        assert_eq!(frame_v1.applied_revision, 1);
-        assert_eq!(cache.cached_frame_count(10), 1);
-
-        // Head advances to revision 2
-        head.applied_revision = 2;
-        head.patch_count = 2;
-        patches.push(SolarChunkPatch {
-            id: 2,
-            chunk_key,
-            world_key: 10,
-            chunk_x: 0,
-            chunk_z: 0,
-            revision: 2,
-            edits: vec![SolarBlockEdit::new(1, 64, 1, 2)],
-            actor: "actor_2".to_string(),
-            created_at: Timestamp::from_micros_since_unix_epoch(20),
-        });
-
-        // Trigger head update event -> invalidates cached frame v1
-        cache.on_chunk_head_updated(&head);
-        assert_eq!(cache.cached_frame_count(10), 0, "Cached frame must be invalidated on head revision advance");
-
-        // Next call reconstructs with new patch -> returns revision 2
-        let frame_v2 = cache.get_or_reconstruct(chunk_key, Some(&base), Some(&head), &patches).unwrap();
-        assert_eq!(frame_v2.applied_revision, 2);
-        assert_eq!(cache.cached_frame_count(10), 1);
-    }
-
-    #[test]
-    fn test_native_cache_hit_avoids_reconstruction() {
-        let mut cache = SolarNativeCache::new();
-        cache.attach_world(10);
-
-        let chunk_key = pack_chunk_key(10, 0, 0);
-        let base = SolarChunkBase {
-            chunk_key,
-            world_key: 10,
-            chunk_x: 0,
-            chunk_z: 0,
-            data: vec![0x10, 0x20],
-            base_revision: 0,
-            created_at: Timestamp::from_micros_since_unix_epoch(1),
-            updated_at: Timestamp::from_micros_since_unix_epoch(1),
-        };
-        let head = SolarChunkHead {
-            chunk_key,
-            world_key: 10,
-            chunk_x: 0,
-            chunk_z: 0,
-            applied_revision: 1,
-            base_revision: 0,
-            patch_count: 1,
-            updated_at: Timestamp::from_micros_since_unix_epoch(10),
-            last_actor: "actor_1".to_string(),
-        };
-        let patches = vec![SolarChunkPatch {
-            id: 1,
-            chunk_key,
-            world_key: 10,
-            chunk_x: 0,
-            chunk_z: 0,
-            revision: 1,
-            edits: vec![SolarBlockEdit::new(0, 64, 0, 1)],
-            actor: "actor_1".to_string(),
-            created_at: Timestamp::from_micros_since_unix_epoch(10),
-        }];
-
-        // 1. Initial reconstruction
-        let frame_v1 = cache.get_or_reconstruct(chunk_key, Some(&base), Some(&head), &patches).unwrap();
-        assert_eq!(frame_v1.applied_revision, 1);
-
-        // 2. Cache hit: empty patches slice passed, but returns cached frame with 1 patch
-        let frame_cached = cache.get_or_reconstruct(chunk_key, Some(&base), Some(&head), &[]).unwrap();
-        assert_eq!(frame_cached.applied_revision, 1);
-        assert_eq!(frame_cached.ordered_patches.len(), 1, "Cache hit must return stored frame without re-evaluating empty patches slice");
-    }
-
-    #[test]
-    fn test_native_cache_world_isolation_and_cleanup_guarantees() {
-        let mut cache = SolarNativeCache::new();
+        let mut cache = SolarNativeCache::new(config);
         cache.attach_world(1);
-        cache.attach_world(2);
 
-        let key_1 = pack_chunk_key(1, 0, 0);
-        let key_2 = pack_chunk_key(2, 0, 0);
+        let k1 = pack_chunk_key(1, 0, 0);
+        let k2 = pack_chunk_key(1, 1, 0);
+        let k3 = pack_chunk_key(1, 2, 0);
+        let k4 = pack_chunk_key(1, 3, 0);
 
-        let base_1 = SolarChunkBase {
-            chunk_key: key_1,
+        let mk_base = |key, x| SolarChunkBase {
+            chunk_key: key,
             world_key: 1,
-            chunk_x: 0,
+            chunk_x: x,
             chunk_z: 0,
-            data: vec![0x01],
+            data: vec![0xAA, 0xBB],
             base_revision: 0,
             created_at: Timestamp::from_micros_since_unix_epoch(1),
             updated_at: Timestamp::from_micros_since_unix_epoch(1),
         };
-        let head_1 = SolarChunkHead {
-            chunk_key: key_1,
+        let mk_head = |key, x| SolarChunkHead {
+            chunk_key: key,
             world_key: 1,
-            chunk_x: 0,
+            chunk_x: x,
             chunk_z: 0,
             applied_revision: 0,
             base_revision: 0,
             patch_count: 0,
             updated_at: Timestamp::from_micros_since_unix_epoch(1),
-            last_actor: "system".to_string(),
+            last_actor: "init".to_string(),
         };
 
-        let base_2 = SolarChunkBase {
-            chunk_key: key_2,
-            world_key: 2,
-            chunk_x: 0,
+        // Insert frames 1, 2, 3
+        cache.get_or_reconstruct(k1, Some(&mk_base(k1, 0)), Some(&mk_head(k1, 0)), &[]).unwrap();
+        cache.get_or_reconstruct(k2, Some(&mk_base(k2, 1)), Some(&mk_head(k2, 1)), &[]).unwrap();
+        cache.get_or_reconstruct(k3, Some(&mk_base(k3, 2)), Some(&mk_head(k3, 2)), &[]).unwrap();
+
+        assert_eq!(cache.cached_frame_count(1), 3);
+        assert_eq!(cache.metrics().evictions_lru, 0);
+
+        // Touch k1 to make k2 the oldest
+        cache.get_or_reconstruct(k1, Some(&mk_base(k1, 0)), Some(&mk_head(k1, 0)), &[]).unwrap();
+
+        // Insert k4 -> should evict k2 (oldest LRU entry)
+        cache.get_or_reconstruct(k4, Some(&mk_base(k4, 3)), Some(&mk_head(k4, 3)), &[]).unwrap();
+
+        assert_eq!(cache.cached_frame_count(1), 3);
+        assert_eq!(cache.metrics().evictions_lru, 1);
+        assert!(cache.metrics().evicted_bytes > 0);
+    }
+
+    #[test]
+    fn test_cache_pinned_chunks_never_evicted() {
+        let config = SolarCacheConfig {
+            max_world_bytes: 1024 * 1024,
+            max_world_frames: 2,
+            max_global_bytes: 10 * 1024 * 1024,
+            max_global_frames: 10,
+        };
+        let mut cache = SolarNativeCache::new(config);
+        cache.attach_world(1);
+
+        let k1 = pack_chunk_key(1, 0, 0);
+        let k2 = pack_chunk_key(1, 1, 0);
+        let k3 = pack_chunk_key(1, 2, 0);
+
+        let mk_base = |key, x| SolarChunkBase {
+            chunk_key: key,
+            world_key: 1,
+            chunk_x: x,
             chunk_z: 0,
-            data: vec![0x02],
+            data: vec![0x11],
             base_revision: 0,
             created_at: Timestamp::from_micros_since_unix_epoch(1),
             updated_at: Timestamp::from_micros_since_unix_epoch(1),
         };
-        let head_2 = SolarChunkHead {
-            chunk_key: key_2,
-            world_key: 2,
-            chunk_x: 0,
+        let mk_head = |key, x| SolarChunkHead {
+            chunk_key: key,
+            world_key: 1,
+            chunk_x: x,
             chunk_z: 0,
             applied_revision: 0,
             base_revision: 0,
             patch_count: 0,
             updated_at: Timestamp::from_micros_since_unix_epoch(1),
-            last_actor: "system".to_string(),
+            last_actor: "init".to_string(),
         };
 
-        cache.get_or_reconstruct(key_1, Some(&base_1), Some(&head_1), &[]).unwrap();
-        cache.get_or_reconstruct(key_2, Some(&base_2), Some(&head_2), &[]).unwrap();
+        // Insert k1 and k2
+        cache.get_or_reconstruct(k1, Some(&mk_base(k1, 0)), Some(&mk_head(k1, 0)), &[]).unwrap();
+        cache.get_or_reconstruct(k2, Some(&mk_base(k2, 1)), Some(&mk_head(k2, 1)), &[]).unwrap();
 
-        assert_eq!(cache.cached_frame_count(1), 1);
-        assert_eq!(cache.cached_frame_count(2), 1);
+        // Pin k1 (oldest)
+        assert!(cache.pin_chunk(k1));
+        assert!(cache.is_chunk_pinned(k1));
+        assert_eq!(cache.metrics().pinned_frames, 1);
 
-        // Detach world 1
-        assert!(cache.detach_world(1));
-        assert_eq!(cache.cached_frame_count(1), 0, "Detached world must drop all cached entries");
+        // Insert k3 -> would normally evict k1, but k1 is pinned, so k2 is evicted
+        cache.get_or_reconstruct(k3, Some(&mk_base(k3, 2)), Some(&mk_head(k3, 2)), &[]).unwrap();
 
-        // World 2 remains intact
-        assert_eq!(cache.cached_frame_count(2), 1, "Remaining world cache must be isolated and unaffected");
+        assert_eq!(cache.cached_frame_count(1), 2);
+        assert!(cache.is_chunk_pinned(k1), "Pinned chunk k1 must survive eviction");
+
+        // Unpin k1
+        assert!(cache.unpin_chunk(k1));
+        assert!(!cache.is_chunk_pinned(k1));
+        assert_eq!(cache.metrics().pinned_frames, 0);
+    }
+
+    #[test]
+    fn test_tile_reference_counting_and_duplicate_suppression() {
+        let mut tracker = SolarTileTracker::new(100);
+        assert_eq!(tracker.active_tile_count(), 0);
+
+        // Player 1 subscribes to tile (0, 0) -> newly active
+        assert!(tracker.subscribe_tile(0, 0));
+        assert_eq!(tracker.subscriber_count(0, 0), 1);
+        assert!(tracker.is_tile_active(0, 0));
+        assert_eq!(tracker.active_tile_count(), 1);
+
+        // Player 2 subscribes to same tile (0, 0) -> suppressed duplicate, refcount incremented
+        assert!(!tracker.subscribe_tile(0, 0));
+        assert_eq!(tracker.subscriber_count(0, 0), 2);
+        assert_eq!(tracker.active_tile_count(), 1);
+
+        // Player 1 leaves tile (0, 0) -> tile remains active because Player 2 is still present
+        assert!(!tracker.unsubscribe_tile(0, 0));
+        assert_eq!(tracker.subscriber_count(0, 0), 1);
+        assert!(tracker.is_tile_active(0, 0));
+
+        // Player 2 leaves tile (0, 0) -> refcount drops to 0, tile cleaned up
+        assert!(tracker.unsubscribe_tile(0, 0));
+        assert_eq!(tracker.subscriber_count(0, 0), 0);
+        assert!(!tracker.is_tile_active(0, 0));
+        assert_eq!(tracker.active_tile_count(), 0);
+    }
+
+    #[test]
+    fn test_tile_interest_hysteresis_boundary() {
+        // Player at chunk (0, 0), view distance = 8 chunks (1 tile radius), hysteresis = 2 chunks
+        let (load_tiles, retain_tiles) = compute_tile_interest_with_hysteresis(0, 0, 8, 2);
+
+        assert!(load_tiles.contains(&(0, 0)));
+        assert!(retain_tiles.contains(&(0, 0)));
+
+        // Retention set includes the wider hysteresis buffer
+        assert!(retain_tiles.len() >= load_tiles.len());
+
+        let bounds = tile_to_chunk_bounds(0, 0);
+        assert_eq!(bounds, (0, 7, 0, 7));
+
+        let keys = tile_chunk_keys(1, 0, 0);
+        assert_eq!(keys.len(), 64);
+    }
+
+    #[test]
+    fn test_priority_calculation_nearest_and_predicted() {
+        let px = 10;
+        let pz = 10;
+
+        // Chunk directly on player position -> distance = 0
+        let p_center = calculate_nearest_priority(10, 10, px, pz);
+        assert_eq!(p_center, 0.0);
+
+        // Chunk at (13, 14) -> distance = 5.0
+        let p_diag = calculate_nearest_priority(13, 14, px, pz);
+        assert!((p_diag - 5.0).abs() < 1e-4);
+
+        // Player moving north (+Z) with velocity = (0.0, 5.0) chunks/sec
+        // Chunk ahead at (10, 15) vs chunk behind at (10, 5)
+        let p_ahead = calculate_movement_predicted_priority(10, 15, px, pz, 0.0, 5.0, 1.0);
+        let p_behind = calculate_movement_predicted_priority(10, 5, px, pz, 0.0, 5.0, 1.0);
+
+        assert!(p_ahead < p_behind, "Chunk in front of moving player must have higher priority (lower score)");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 5 Tests: Codec Envelope, Fold Engine, Frame Ownership
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_codec_roundtrip_encode_decode() {
+        let payload = vec![0x10, 0x20, 0x30, 0x40, 0x50];
+        let envelope = SolarChunkEnvelope::new(42, 5, -8, 1, 3, payload.clone()).unwrap();
+
+        let encoded = envelope.encode();
+        assert_eq!(encoded.len(), ENVELOPE_HEADER_SIZE + payload.len());
+
+        let decoded = SolarChunkEnvelope::decode(&encoded).unwrap();
+        assert_eq!(decoded.world_key, 42);
+        assert_eq!(decoded.chunk_x, 5);
+        assert_eq!(decoded.chunk_z, -8);
+        assert_eq!(decoded.base_revision, 1);
+        assert_eq!(decoded.applied_revision, 3);
+        assert_eq!(decoded.payload, payload);
+    }
+
+    #[test]
+    fn test_codec_corruption_checksum_rejection() {
+        let payload = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        let envelope = SolarChunkEnvelope::new(1, 0, 0, 0, 0, payload).unwrap();
+        let mut encoded = envelope.encode();
+
+        // Corrupt a byte in the payload
+        let last_idx = encoded.len() - 1;
+        encoded[last_idx] ^= 0xFF;
+
+        let res = SolarChunkEnvelope::decode(&encoded);
+        assert!(matches!(res, Err(SolarCodecError::ChecksumMismatch { .. })));
+    }
+
+    #[test]
+    fn test_codec_unsupported_version_rejection() {
+        let payload = vec![0x01];
+        let envelope = SolarChunkEnvelope::new(1, 0, 0, 0, 0, payload).unwrap();
+        let mut encoded = envelope.encode();
+
+        // Overwrite version field (bytes 4..6) with version 99
+        encoded[4] = 0;
+        encoded[5] = 99;
+
+        let res = SolarChunkEnvelope::decode(&encoded);
+        assert!(matches!(res, Err(SolarCodecError::UnsupportedVersion { version: 99 })));
+    }
+
+    #[test]
+    fn test_codec_size_limit_rejection() {
+        let oversized = vec![0u8; MAX_ENVELOPE_PAYLOAD_SIZE + 1];
+        let res = SolarChunkEnvelope::new(1, 0, 0, 0, 0, oversized);
+        assert!(matches!(res, Err(SolarCodecError::PayloadTooLarge { .. })));
+    }
+
+    #[test]
+    fn test_codec_truncated_buffer_rejection() {
+        let short_bytes = vec![b'S', b'O', b'L', b'R']; // only 4 bytes instead of 48
+        let res = SolarChunkEnvelope::decode(&short_bytes);
+        assert!(matches!(res, Err(SolarCodecError::TruncatedBuffer { .. })));
+    }
+
+    #[test]
+    fn test_pure_rust_base_plus_patch_fold() {
+        let chunk_key = pack_chunk_key(10, 0, 0);
+        let frame = SolarChunkFrame {
+            chunk_key,
+            world_key: 10,
+            chunk_x: 0,
+            chunk_z: 0,
+            applied_revision: 2,
+            base_revision: 0,
+            base_data: vec![0x01, 0x02, 0x03],
+            ordered_patches: vec![
+                SolarChunkPatchFrame {
+                    revision: 1,
+                    edits: vec![SolarBlockEdit::new(0, 64, 0, 10)],
+                    actor: "player_1".to_string(),
+                },
+                SolarChunkPatchFrame {
+                    revision: 2,
+                    edits: vec![SolarBlockEdit::new(1, 64, 1, 20)],
+                    actor: "player_2".to_string(),
+                },
+            ],
+        };
+
+        let folded = fold_chunk_frame(&frame).unwrap();
+        assert_eq!(folded.world_key, 10);
+        assert_eq!(folded.chunk_x, 0);
+        assert_eq!(folded.chunk_z, 0);
+        assert_eq!(folded.revision, 2);
+        assert_eq!(folded.folded_patch_count, 2);
+        assert_eq!(folded.folded_edit_count, 2);
+        assert!(!folded.data.is_empty());
+    }
+
+    #[test]
+    fn test_frame_ownership_handle_immutability_and_tokens() {
+        let folded = SolarFoldedChunk {
+            world_key: 50,
+            chunk_x: 2,
+            chunk_z: -3,
+            revision: 5,
+            data: vec![0xAA, 0xBB, 0xCC],
+            folded_patch_count: 0,
+            folded_edit_count: 0,
+        };
+
+        let handle = SolarFrameHandle::publish(1001, folded);
+        assert_eq!(handle.release_token(), 1001);
+        assert_eq!(handle.revision(), 5);
+        assert_eq!(handle.data(), &[0xAA, 0xBB, 0xCC]);
+        assert_eq!(handle.strong_count(), 1);
+
+        // Retain another handle
+        let handle_clone = handle.retain_handle();
+        assert_eq!(handle.strong_count(), 2);
+        assert_eq!(handle_clone.release_token(), 1001);
+
+        drop(handle_clone);
+        assert_eq!(handle.strong_count(), 1);
     }
 }
 

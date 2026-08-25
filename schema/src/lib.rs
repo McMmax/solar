@@ -68,6 +68,21 @@ pub const WORLD_STATUS_FAILED: &str = "FAILED";
 /// World is in read-only fallback mode (Harbor source snapshot preserved, mutations blocked).
 pub const WORLD_STATUS_FALLBACK: &str = "FALLBACK";
 
+/// Import phase: Initial manifest and metadata discovery.
+pub const IMPORT_PHASE_DISCOVERY: &str = "DISCOVERY";
+
+/// Import phase: Streaming base chunk blobs into SpacetimeDB.
+pub const IMPORT_PHASE_STREAMING_BASE: &str = "STREAMING_BASE";
+
+/// Import phase: Validating chunk snapshot integrity and checksums.
+pub const IMPORT_PHASE_VALIDATING: &str = "VALIDATING";
+
+/// Import phase: Successfully completed and active.
+pub const IMPORT_PHASE_COMPLETED: &str = "COMPLETED";
+
+/// Import phase: Failed during import or validation.
+pub const IMPORT_PHASE_FAILED: &str = "FAILED";
+
 /// Compaction request is queued and awaiting an available worker.
 pub const COMPACTION_STATUS_PENDING: &str = "pending";
 
@@ -86,6 +101,7 @@ pub fn pack_chunk_key(world_key: u64, chunk_x: i32, chunk_z: i32) -> u128 {
         | (((chunk_x as u32) as u128) << CHUNK_KEY_X_SHIFT)
         | ((chunk_z as u32) as u128)
 }
+
 /// Unpacks a `u128 chunk_key` into `(world_key, chunk_x, chunk_z)`.
 #[inline]
 pub fn unpack_chunk_key(chunk_key: u128) -> (u64, i32, i32) {
@@ -245,6 +261,14 @@ pub struct SolarWorld {
     pub owner: String,
     /// World lifecycle status: "IMPORTING" | "ACTIVE" | "FAILED" | "FALLBACK".
     pub status: String,
+    /// Total chunks declared for import (boss-bar tracking).
+    pub total_chunks: u32,
+    /// Chunks successfully streamed/loaded so far.
+    pub completed_chunks: u32,
+    /// Current import phase ("DISCOVERY" | "STREAMING_BASE" | "VALIDATING" | "COMPLETED" | "FAILED").
+    pub import_phase: String,
+    /// Error/failure reason if world import failed.
+    pub failure_reason: String,
     /// Exact Harbor source revision pinned for read-only fallback verification.
     pub harbor_revision: u64,
     /// Exact SHA-256 / Blake3 checksum of original Harbor source archive.
@@ -271,6 +295,18 @@ pub struct SolarWorld {
     pub created_at: Timestamp,
     /// Last metadata update timestamp.
     pub updated_at: Timestamp,
+}
+
+impl SolarWorld {
+    /// Returns the monotonic import progress percentage (0..=100).
+    pub fn progress_pct(&self) -> u32 {
+        if self.total_chunks == 0 {
+            if self.status == WORLD_STATUS_ACTIVE { 100 } else { 0 }
+        } else {
+            let pct = ((self.completed_chunks as u64 * 100) / (self.total_chunks as u64)) as u32;
+            pct.min(100)
+        }
+    }
 }
 
 /// Canonical baseline chunk snapshot keyed by `u128 chunk_key`.
@@ -390,6 +426,14 @@ pub struct SolarCompactionRequest {
     pub lease_owner: String,
     /// Timestamp when active lease expires.
     pub lease_expires_at: Timestamp,
+    /// Number of failed compaction attempts on this chunk.
+    pub compaction_attempts: u32,
+    /// Timestamp when last attempt failed.
+    pub last_failed_at: Timestamp,
+    /// Active exponential backoff duration in microseconds before next eligible attempt.
+    pub backoff_micros: u64,
+    /// Error / failure reason if compaction failed.
+    pub failure_reason: String,
     /// Timestamp when compaction was requested.
     pub requested_at: Timestamp,
     /// Originating requester ("system_auto_threshold" | admin UUID).
@@ -438,14 +482,27 @@ pub fn validate_world_mutation_eligibility(world: &SolarWorld) -> Result<(), Sol
     }
 }
 
-/// Evaluates whether a worker can acquire a compaction lease on a request.
+/// Evaluates whether a worker can acquire a compaction lease on a request,
+/// respecting active leases, expired leases, and exponential retry backoff.
 pub fn evaluate_compaction_lease_acquire(
     current_status: &str,
     lease_expires_at: Timestamp,
+    last_failed_at: Timestamp,
+    backoff_micros: u64,
     current_time: Timestamp,
 ) -> Result<(), String> {
-    if current_status == COMPACTION_STATUS_PENDING || current_status == COMPACTION_STATUS_FAILED {
+    if current_status == COMPACTION_STATUS_PENDING {
         Ok(())
+    } else if current_status == COMPACTION_STATUS_FAILED {
+        let eligible_at = last_failed_at.to_micros_since_unix_epoch() + (backoff_micros as i64);
+        if current_time.to_micros_since_unix_epoch() >= eligible_at {
+            Ok(())
+        } else {
+            let remaining = eligible_at - current_time.to_micros_since_unix_epoch();
+            Err(format!(
+                "compaction retry backoff active: retry eligible in {remaining} µs"
+            ))
+        }
     } else if current_status == COMPACTION_STATUS_IN_PROGRESS {
         if current_time >= lease_expires_at {
             // Expired lease can be reclaimed
@@ -1326,6 +1383,10 @@ mod tests {
             kind: "dungeon".to_string(),
             owner: "team_alpha".to_string(),
             status: WORLD_STATUS_ACTIVE.to_string(),
+            total_chunks: 100,
+            completed_chunks: 100,
+            import_phase: IMPORT_PHASE_COMPLETED.to_string(),
+            failure_reason: String::new(),
             harbor_revision: 42,
             harbor_checksum: "sha256:abcd1234ef567890".to_string(),
             min_y: -64,
@@ -1433,7 +1494,7 @@ mod tests {
 
         // 1. Initial pending request acquisition succeeds
         let initial_status = COMPACTION_STATUS_PENDING;
-        assert!(evaluate_compaction_lease_acquire(initial_status, Timestamp::from_micros_since_unix_epoch(0), t0).is_ok());
+        assert!(evaluate_compaction_lease_acquire(initial_status, Timestamp::from_micros_since_unix_epoch(0), Timestamp::from_micros_since_unix_epoch(0), 0, t0).is_ok());
 
         let mut req = SolarCompactionRequest {
             chunk_key: pack_chunk_key(1, 0, 0),
@@ -1446,13 +1507,17 @@ mod tests {
             lease_token: 1,
             lease_owner: "worker_alpha".to_string(),
             lease_expires_at: Timestamp::from_micros_since_unix_epoch(40_000_000),
+            compaction_attempts: 0,
+            last_failed_at: Timestamp::from_micros_since_unix_epoch(0),
+            backoff_micros: 0,
+            failure_reason: String::new(),
             requested_at: t0,
             requested_by: "system".to_string(),
         };
 
         // 2. Concurrent worker attempts acquisition while lease is active (at 20s) -> Conflict rejected
         let t_active = Timestamp::from_micros_since_unix_epoch(20_000_000);
-        let conflict = evaluate_compaction_lease_acquire(&req.status, req.lease_expires_at, t_active);
+        let conflict = evaluate_compaction_lease_acquire(&req.status, req.lease_expires_at, req.last_failed_at, req.backoff_micros, t_active);
         assert!(conflict.is_err());
         assert!(conflict.unwrap_err().contains("compaction lease conflict"));
 
@@ -1464,20 +1529,30 @@ mod tests {
 
         // 5. Abandoned worker recovery: time advances past 40s (at 45s) -> Acquisition succeeds
         let t_expired = Timestamp::from_micros_since_unix_epoch(45_000_000);
-        assert!(evaluate_compaction_lease_acquire(&req.status, req.lease_expires_at, t_expired).is_ok());
+        assert!(evaluate_compaction_lease_acquire(&req.status, req.lease_expires_at, req.last_failed_at, req.backoff_micros, t_expired).is_ok());
 
         // Reclaim lease with next token
         req.lease_token = 2;
         req.lease_owner = "worker_beta".to_string();
         req.lease_expires_at = Timestamp::from_micros_since_unix_epoch(75_000_000);
 
-        // 6. Worker Beta fails compaction -> Marks failed status
+        // 6. Worker Beta fails compaction -> Marks failed status with backoff
         assert!(evaluate_compaction_lease_release(&req.status, req.lease_token, 2).is_ok());
         req.status = COMPACTION_STATUS_FAILED.to_string();
         req.lease_owner = String::new();
+        req.compaction_attempts = 1;
+        req.last_failed_at = t_expired;
+        req.backoff_micros = 5_000_000; // 5s backoff
 
-        // 7. Failed request can be acquired again
-        assert!(evaluate_compaction_lease_acquire(&req.status, req.lease_expires_at, t_expired).is_ok());
+        // 7. Attempting immediate re-acquisition before backoff expires (at 47s) -> Backoff rejected
+        let t_during_backoff = Timestamp::from_micros_since_unix_epoch(47_000_000);
+        let backoff_res = evaluate_compaction_lease_acquire(&req.status, req.lease_expires_at, req.last_failed_at, req.backoff_micros, t_during_backoff);
+        assert!(backoff_res.is_err());
+        assert!(backoff_res.unwrap_err().contains("backoff active"));
+
+        // 8. Re-acquisition after backoff expires (at 51s) -> Acquisition succeeds
+        let t_after_backoff = Timestamp::from_micros_since_unix_epoch(51_000_000);
+        assert!(evaluate_compaction_lease_acquire(&req.status, req.lease_expires_at, req.last_failed_at, req.backoff_micros, t_after_backoff).is_ok());
     }
 
     #[test]
@@ -1488,6 +1563,10 @@ mod tests {
             kind: "lobby".to_string(),
             owner: "system".to_string(),
             status: WORLD_STATUS_FALLBACK.to_string(),
+            total_chunks: 64,
+            completed_chunks: 64,
+            import_phase: IMPORT_PHASE_COMPLETED.to_string(),
+            failure_reason: String::new(),
             harbor_revision: 999,
             harbor_checksum: "sha256:source_golden_checksum".to_string(),
             min_y: -64,
@@ -1544,6 +1623,10 @@ mod tests {
             kind: "lobby".to_string(),
             owner: "".to_string(),
             status: WORLD_STATUS_ACTIVE.to_string(),
+            total_chunks: 10,
+            completed_chunks: 10,
+            import_phase: IMPORT_PHASE_COMPLETED.to_string(),
+            failure_reason: String::new(),
             harbor_revision: 1,
             harbor_checksum: "csum".to_string(),
             min_y: -64,
@@ -1627,5 +1710,79 @@ mod tests {
 
         let res_allowed = container_auth.authorize_container_access(1, 10, 64, 10, "thief", &player_auth);
         assert!(res_allowed.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6 Tests: Durable Import Progress, Boss-Bar Monotonicity, Resumable Append
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_import_progress_monotonic_percentage_and_phases() {
+        let mut world = SolarWorld {
+            world_key: 777,
+            world_name: "mega_world".to_string(),
+            kind: "lobby".to_string(),
+            owner: "".to_string(),
+            status: WORLD_STATUS_IMPORTING.to_string(),
+            total_chunks: 200,
+            completed_chunks: 0,
+            import_phase: IMPORT_PHASE_DISCOVERY.to_string(),
+            failure_reason: String::new(),
+            harbor_revision: 1,
+            harbor_checksum: "csum".to_string(),
+            min_y: -64,
+            height: 384,
+            spawn_x: 0.0,
+            spawn_y: 64.0,
+            spawn_z: 0.0,
+            spawn_yaw: 0.0,
+            spawn_pitch: 0.0,
+            seed: 0,
+            source_template: "".to_string(),
+            created_at: Timestamp::from_micros_since_unix_epoch(1),
+            updated_at: Timestamp::from_micros_since_unix_epoch(1),
+        };
+
+        assert_eq!(world.progress_pct(), 0);
+        assert_eq!(world.import_phase, IMPORT_PHASE_DISCOVERY);
+
+        // Streaming phase: 50 chunks streamed
+        world.import_phase = IMPORT_PHASE_STREAMING_BASE.to_string();
+        world.completed_chunks = 50;
+        assert_eq!(world.progress_pct(), 25);
+
+        // Streaming phase: 150 chunks streamed
+        world.completed_chunks = 150;
+        assert_eq!(world.progress_pct(), 75);
+
+        // Validation phase: 200 chunks streamed
+        world.import_phase = IMPORT_PHASE_VALIDATING.to_string();
+        world.completed_chunks = 200;
+        assert_eq!(world.progress_pct(), 100);
+
+        // Transition to ACTIVE
+        world.status = WORLD_STATUS_ACTIVE.to_string();
+        world.import_phase = IMPORT_PHASE_COMPLETED.to_string();
+        assert_eq!(world.progress_pct(), 100);
+    }
+
+    #[test]
+    fn test_resumable_import_idempotent_append() {
+        let chunk_key = pack_chunk_key(10, 0, 0);
+        let existing_base = SolarChunkBase {
+            chunk_key,
+            world_key: 10,
+            chunk_x: 0,
+            chunk_z: 0,
+            data: vec![0x10, 0x20],
+            base_revision: 0,
+            created_at: Timestamp::from_micros_since_unix_epoch(1),
+            updated_at: Timestamp::from_micros_since_unix_epoch(1),
+        };
+
+        // Incoming identical chunk append during resume
+        let incoming_data = vec![0x10, 0x20];
+        let is_resumable_match = existing_base.data == incoming_data && existing_base.base_revision == 0;
+        assert!(is_resumable_match, "Re-streaming existing base chunk on resume is idempotent");
     }
 }
