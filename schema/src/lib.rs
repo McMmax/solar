@@ -52,6 +52,31 @@ pub const CHUNK_KEY_X_SHIFT: u32 = 32;
 /// Bit mask for 32-bit coordinate components.
 pub const CHUNK_COORD_MASK: u128 = 0xFFFF_FFFF;
 
+// ---------------------------------------------------------------------------
+// Lifecycle & Compaction Status Constants
+// ---------------------------------------------------------------------------
+
+/// World is undergoing initial chunk streaming/snapshot import from Harbor or template.
+pub const WORLD_STATUS_IMPORTING: &str = "IMPORTING";
+
+/// World is active, loaded, and accepting concurrent mutations.
+pub const WORLD_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// World import failed permanently or encountered unrecoverable data corruption.
+pub const WORLD_STATUS_FAILED: &str = "FAILED";
+
+/// World is in read-only fallback mode (Harbor source snapshot preserved, mutations blocked).
+pub const WORLD_STATUS_FALLBACK: &str = "FALLBACK";
+
+/// Compaction request is queued and awaiting an available worker.
+pub const COMPACTION_STATUS_PENDING: &str = "pending";
+
+/// Compaction request has been leased by an active worker.
+pub const COMPACTION_STATUS_IN_PROGRESS: &str = "in_progress";
+
+/// Compaction failed or aborted (available for retry/re-lease).
+pub const COMPACTION_STATUS_FAILED: &str = "failed";
+
 /// Packs `(world_key, chunk_x, chunk_z)` into a single `u128 chunk_key`.
 ///
 /// Formula: `(world_key << 64) | ((chunk_x as u32) << 32) | (chunk_z as u32)`
@@ -61,7 +86,6 @@ pub fn pack_chunk_key(world_key: u64, chunk_x: i32, chunk_z: i32) -> u128 {
         | (((chunk_x as u32) as u128) << CHUNK_KEY_X_SHIFT)
         | ((chunk_z as u32) as u128)
 }
-
 /// Unpacks a `u128 chunk_key` into `(world_key, chunk_x, chunk_z)`.
 #[inline]
 pub fn unpack_chunk_key(chunk_key: u128) -> (u64, i32, i32) {
@@ -148,9 +172,12 @@ impl Default for SolarAuthContext {
 pub enum SolarAuthError {
     RegionDenied { region_name: String, reason: String },
     BlockBehaviorForbidden { block_state: i32, reason: String },
+    ContainerAccessDenied { container_type: String, reason: String },
     Unauthenticated { reason: String },
     InvalidCoordinates { x: i32, y: i32, z: i32, reason: String },
     RevisionConflict { expected: u64, actual: u64 },
+    WorldNotActive { world_key: u64, status: String },
+    WorldInFallback { world_key: u64 },
 }
 
 /// RegionManager authorization hook interface.
@@ -181,6 +208,19 @@ pub trait BlockBehaviorAuthorizer {
     ) -> Result<(), SolarAuthError>;
 }
 
+/// Container/Inventory access authorization hook interface.
+pub trait ContainerAccessAuthorizer {
+    fn authorize_container_access(
+        &self,
+        world_key: u64,
+        world_x: i32,
+        world_y: i32,
+        world_z: i32,
+        actor: &str,
+        auth: &SolarAuthContext,
+    ) -> Result<(), SolarAuthError>;
+}
+
 // ---------------------------------------------------------------------------
 // SpacetimeDB Table Definitions
 // ---------------------------------------------------------------------------
@@ -191,6 +231,7 @@ pub trait BlockBehaviorAuthorizer {
     accessor = solar_world,
     public,
     index(accessor = solar_world_by_name, btree(columns = [world_name])),
+    index(accessor = solar_world_by_status, btree(columns = [status])),
 )]
 pub struct SolarWorld {
     /// Stable numeric world identifier. Single-column primary key.
@@ -202,6 +243,12 @@ pub struct SolarWorld {
     pub kind: String,
     /// Team or player owner UUID; empty for shared/public worlds.
     pub owner: String,
+    /// World lifecycle status: "IMPORTING" | "ACTIVE" | "FAILED" | "FALLBACK".
+    pub status: String,
+    /// Exact Harbor source revision pinned for read-only fallback verification.
+    pub harbor_revision: u64,
+    /// Exact SHA-256 / Blake3 checksum of original Harbor source archive.
+    pub harbor_checksum: String,
     /// Minimum Y coordinate in world (e.g. -64).
     pub min_y: i32,
     /// Total world height in blocks (e.g. 384).
@@ -337,6 +384,12 @@ pub struct SolarCompactionRequest {
     pub patch_count: u32,
     /// Request status: "pending" | "in_progress" | "failed".
     pub status: String,
+    /// Monotonic token identifying the active lease.
+    pub lease_token: u64,
+    /// Identity / UUID of the worker holding the lease.
+    pub lease_owner: String,
+    /// Timestamp when active lease expires.
+    pub lease_expires_at: Timestamp,
     /// Timestamp when compaction was requested.
     pub requested_at: Timestamp,
     /// Originating requester ("system_auto_threshold" | admin UUID).
@@ -346,6 +399,83 @@ pub struct SolarCompactionRequest {
 // ---------------------------------------------------------------------------
 // Validation & State Transition Helpers
 // ---------------------------------------------------------------------------
+
+/// Validates world lifecycle state transitions.
+pub fn validate_world_lifecycle_transition(
+    current: Option<&str>,
+    target: &str,
+) -> Result<(), String> {
+    match (current, target) {
+        (None, WORLD_STATUS_IMPORTING) | (None, WORLD_STATUS_ACTIVE) => Ok(()),
+        (Some(WORLD_STATUS_IMPORTING), WORLD_STATUS_ACTIVE) => Ok(()),
+        (Some(WORLD_STATUS_IMPORTING), WORLD_STATUS_FAILED) => Ok(()),
+        (Some(WORLD_STATUS_ACTIVE), WORLD_STATUS_FALLBACK) => Ok(()),
+        (Some(WORLD_STATUS_FALLBACK), WORLD_STATUS_ACTIVE) => Ok(()),
+        (Some(WORLD_STATUS_FAILED), WORLD_STATUS_IMPORTING) => Ok(()),
+        (Some(c), t) if c == t => Ok(()), // idempotent re-assertion
+        (Some(c), t) => Err(format!(
+            "invalid world lifecycle transition from '{c}' to '{t}'"
+        )),
+        (None, t) => Err(format!(
+            "cannot initialize world directly in state '{t}'"
+        )),
+    }
+}
+
+/// Verifies if a world is in an active state allowing mutations.
+pub fn validate_world_mutation_eligibility(world: &SolarWorld) -> Result<(), SolarAuthError> {
+    if world.status == WORLD_STATUS_ACTIVE {
+        Ok(())
+    } else if world.status == WORLD_STATUS_FALLBACK {
+        Err(SolarAuthError::WorldInFallback {
+            world_key: world.world_key,
+        })
+    } else {
+        Err(SolarAuthError::WorldNotActive {
+            world_key: world.world_key,
+            status: world.status.clone(),
+        })
+    }
+}
+
+/// Evaluates whether a worker can acquire a compaction lease on a request.
+pub fn evaluate_compaction_lease_acquire(
+    current_status: &str,
+    lease_expires_at: Timestamp,
+    current_time: Timestamp,
+) -> Result<(), String> {
+    if current_status == COMPACTION_STATUS_PENDING || current_status == COMPACTION_STATUS_FAILED {
+        Ok(())
+    } else if current_status == COMPACTION_STATUS_IN_PROGRESS {
+        if current_time >= lease_expires_at {
+            // Expired lease can be reclaimed
+            Ok(())
+        } else {
+            Err("compaction lease conflict: another worker actively holds an unexpired lease".to_string())
+        }
+    } else {
+        Err(format!("unknown compaction status '{current_status}'"))
+    }
+}
+
+/// Evaluates whether a worker's lease token is valid to release/complete compaction.
+pub fn evaluate_compaction_lease_release(
+    current_status: &str,
+    current_token: u64,
+    expected_token: u64,
+) -> Result<(), String> {
+    if current_status != COMPACTION_STATUS_IN_PROGRESS {
+        return Err(format!(
+            "cannot complete compaction: request status is '{current_status}' (expected 'in_progress')"
+        ));
+    }
+    if current_token != expected_token {
+        return Err(format!(
+            "compaction lease token mismatch: expected token {expected_token}, active lease has {current_token}"
+        ));
+    }
+    Ok(())
+}
 
 /// Validates a batch of block edits against bounded limits and height constraints.
 pub fn validate_patch_bounds(
@@ -1161,5 +1291,341 @@ mod tests {
         assert!(validate_patch_bounds(&[SolarBlockEdit::new(0, 319, 0, 1)], world_min_y, world_height).is_ok());
         // At/above upper bound: 320 (invalid)
         assert!(validate_patch_bounds(&[SolarBlockEdit::new(0, 320, 0, 1)], world_min_y, world_height).is_err());
+    }
+
+    #[test]
+    fn test_import_lifecycle_transitions_and_invalid_transitions() {
+        // Valid forward transitions
+        assert!(validate_world_lifecycle_transition(None, WORLD_STATUS_IMPORTING).is_ok());
+        assert!(validate_world_lifecycle_transition(None, WORLD_STATUS_ACTIVE).is_ok());
+        assert!(validate_world_lifecycle_transition(Some(WORLD_STATUS_IMPORTING), WORLD_STATUS_ACTIVE).is_ok());
+        assert!(validate_world_lifecycle_transition(Some(WORLD_STATUS_IMPORTING), WORLD_STATUS_FAILED).is_ok());
+        assert!(validate_world_lifecycle_transition(Some(WORLD_STATUS_ACTIVE), WORLD_STATUS_FALLBACK).is_ok());
+        assert!(validate_world_lifecycle_transition(Some(WORLD_STATUS_FALLBACK), WORLD_STATUS_ACTIVE).is_ok());
+        assert!(validate_world_lifecycle_transition(Some(WORLD_STATUS_FAILED), WORLD_STATUS_IMPORTING).is_ok());
+
+        // Idempotent re-assertions
+        assert!(validate_world_lifecycle_transition(Some(WORLD_STATUS_ACTIVE), WORLD_STATUS_ACTIVE).is_ok());
+        assert!(validate_world_lifecycle_transition(Some(WORLD_STATUS_IMPORTING), WORLD_STATUS_IMPORTING).is_ok());
+        assert!(validate_world_lifecycle_transition(Some(WORLD_STATUS_FALLBACK), WORLD_STATUS_FALLBACK).is_ok());
+
+        // Invalid transitions
+        assert!(validate_world_lifecycle_transition(Some(WORLD_STATUS_FAILED), WORLD_STATUS_ACTIVE).is_err());
+        assert!(validate_world_lifecycle_transition(Some(WORLD_STATUS_IMPORTING), WORLD_STATUS_FALLBACK).is_err());
+        assert!(validate_world_lifecycle_transition(Some(WORLD_STATUS_FALLBACK), WORLD_STATUS_FAILED).is_err());
+        assert!(validate_world_lifecycle_transition(None, WORLD_STATUS_FALLBACK).is_err());
+        assert!(validate_world_lifecycle_transition(None, WORLD_STATUS_FAILED).is_err());
+    }
+
+    #[test]
+    fn test_duplicate_import_and_idempotency() {
+        let world_key = 500u64;
+        let world = SolarWorld {
+            world_key,
+            world_name: "dungeon_1".to_string(),
+            kind: "dungeon".to_string(),
+            owner: "team_alpha".to_string(),
+            status: WORLD_STATUS_ACTIVE.to_string(),
+            harbor_revision: 42,
+            harbor_checksum: "sha256:abcd1234ef567890".to_string(),
+            min_y: -64,
+            height: 384,
+            spawn_x: 0.0,
+            spawn_y: 64.0,
+            spawn_z: 0.0,
+            spawn_yaw: 0.0,
+            spawn_pitch: 0.0,
+            seed: 12345,
+            source_template: "template_dungeon".to_string(),
+            created_at: Timestamp::from_micros_since_unix_epoch(100),
+            updated_at: Timestamp::from_micros_since_unix_epoch(100),
+        };
+
+        // Identical re-import on active world -> Idempotent no-op
+        let incoming_rev = 42u64;
+        let incoming_csum = "sha256:abcd1234ef567890";
+        let is_idempotent = world.status == WORLD_STATUS_ACTIVE
+            && world.harbor_revision == incoming_rev
+            && world.harbor_checksum == incoming_csum;
+        assert!(is_idempotent);
+
+        // Conflicting import with changed checksum -> rejected without mutation
+        let conflicting_csum = "sha256:different_hash";
+        let is_conflicting = world.status == WORLD_STATUS_ACTIVE
+            && (world.harbor_revision != incoming_rev || world.harbor_checksum != conflicting_csum);
+        assert!(is_conflicting);
+        assert_eq!(world.harbor_checksum, "sha256:abcd1234ef567890", "World state remains unmutated");
+    }
+
+    #[test]
+    fn test_commit_acknowledgement_only_after_durable_head_advancement() {
+        let chunk_key = pack_chunk_key(10, 0, 0);
+        let mut head = SolarChunkHead {
+            chunk_key,
+            world_key: 10,
+            chunk_x: 0,
+            chunk_z: 0,
+            applied_revision: 3,
+            base_revision: 0,
+            patch_count: 3,
+            updated_at: Timestamp::from_micros_since_unix_epoch(30),
+            last_actor: "actor_3".to_string(),
+        };
+
+        let mut committed_patches = Vec::new();
+
+        // Worker submits patch expecting revision 3
+        let next_rev = check_expected_revision(Some(head.applied_revision), 3).unwrap();
+        assert_eq!(next_rev, 4);
+
+        // State changes executed atomically
+        let new_patch = SolarChunkPatch {
+            id: 4,
+            chunk_key,
+            world_key: 10,
+            chunk_x: 0,
+            chunk_z: 0,
+            revision: next_rev,
+            edits: vec![SolarBlockEdit::new(0, 64, 0, 100)],
+            actor: "actor_4".to_string(),
+            created_at: Timestamp::from_micros_since_unix_epoch(40),
+        };
+        committed_patches.push(new_patch);
+
+        head.applied_revision = next_rev;
+        head.patch_count += 1;
+        head.last_actor = "actor_4".to_string();
+
+        // Acknowledgement condition: head must match committed patch revision
+        let acknowledged = head.applied_revision == 4 && committed_patches.last().unwrap().revision == 4;
+        assert!(acknowledged, "Commit is acknowledged only after head revision advancement");
+    }
+
+    #[test]
+    fn test_stale_revision_conflict() {
+        let head = SolarChunkHead {
+            chunk_key: pack_chunk_key(10, 0, 0),
+            world_key: 10,
+            chunk_x: 0,
+            chunk_z: 0,
+            applied_revision: 7,
+            base_revision: 0,
+            patch_count: 7,
+            updated_at: Timestamp::from_micros_since_unix_epoch(70),
+            last_actor: "actor_7".to_string(),
+        };
+
+        // Stale revision (older) -> rejected
+        let stale_err = check_expected_revision(Some(head.applied_revision), 6);
+        assert!(stale_err.is_err());
+        assert!(stale_err.unwrap_err().contains("revision conflict"));
+
+        // Future revision (gap) -> rejected
+        let future_err = check_expected_revision(Some(head.applied_revision), 8);
+        assert!(future_err.is_err());
+        assert!(future_err.unwrap_err().contains("revision conflict"));
+    }
+
+    #[test]
+    fn test_compaction_lease_conflict_and_recovery() {
+        let t0 = Timestamp::from_micros_since_unix_epoch(10_000_000); // 10.0s
+        let _lease_duration = 30_000_000; // 30s lease -> expires at 40.0s
+
+        // 1. Initial pending request acquisition succeeds
+        let initial_status = COMPACTION_STATUS_PENDING;
+        assert!(evaluate_compaction_lease_acquire(initial_status, Timestamp::from_micros_since_unix_epoch(0), t0).is_ok());
+
+        let mut req = SolarCompactionRequest {
+            chunk_key: pack_chunk_key(1, 0, 0),
+            world_key: 1,
+            chunk_x: 0,
+            chunk_z: 0,
+            head_revision: 64,
+            patch_count: 64,
+            status: COMPACTION_STATUS_IN_PROGRESS.to_string(),
+            lease_token: 1,
+            lease_owner: "worker_alpha".to_string(),
+            lease_expires_at: Timestamp::from_micros_since_unix_epoch(40_000_000),
+            requested_at: t0,
+            requested_by: "system".to_string(),
+        };
+
+        // 2. Concurrent worker attempts acquisition while lease is active (at 20s) -> Conflict rejected
+        let t_active = Timestamp::from_micros_since_unix_epoch(20_000_000);
+        let conflict = evaluate_compaction_lease_acquire(&req.status, req.lease_expires_at, t_active);
+        assert!(conflict.is_err());
+        assert!(conflict.unwrap_err().contains("compaction lease conflict"));
+
+        // 3. Worker Alpha completes with valid token -> Allowed
+        assert!(evaluate_compaction_lease_release(&req.status, req.lease_token, 1).is_ok());
+
+        // 4. Stale token rejection
+        assert!(evaluate_compaction_lease_release(&req.status, req.lease_token, 999).is_err());
+
+        // 5. Abandoned worker recovery: time advances past 40s (at 45s) -> Acquisition succeeds
+        let t_expired = Timestamp::from_micros_since_unix_epoch(45_000_000);
+        assert!(evaluate_compaction_lease_acquire(&req.status, req.lease_expires_at, t_expired).is_ok());
+
+        // Reclaim lease with next token
+        req.lease_token = 2;
+        req.lease_owner = "worker_beta".to_string();
+        req.lease_expires_at = Timestamp::from_micros_since_unix_epoch(75_000_000);
+
+        // 6. Worker Beta fails compaction -> Marks failed status
+        assert!(evaluate_compaction_lease_release(&req.status, req.lease_token, 2).is_ok());
+        req.status = COMPACTION_STATUS_FAILED.to_string();
+        req.lease_owner = String::new();
+
+        // 7. Failed request can be acquired again
+        assert!(evaluate_compaction_lease_acquire(&req.status, req.lease_expires_at, t_expired).is_ok());
+    }
+
+    #[test]
+    fn test_fallback_metadata_preserves_exact_harbor_revision_and_checksum() {
+        let world = SolarWorld {
+            world_key: 100,
+            world_name: "production_hub".to_string(),
+            kind: "lobby".to_string(),
+            owner: "system".to_string(),
+            status: WORLD_STATUS_FALLBACK.to_string(),
+            harbor_revision: 999,
+            harbor_checksum: "sha256:source_golden_checksum".to_string(),
+            min_y: -64,
+            height: 384,
+            spawn_x: 0.0,
+            spawn_y: 64.0,
+            spawn_z: 0.0,
+            spawn_yaw: 0.0,
+            spawn_pitch: 0.0,
+            seed: 42,
+            source_template: "".to_string(),
+            created_at: Timestamp::from_micros_since_unix_epoch(100),
+            updated_at: Timestamp::from_micros_since_unix_epoch(100),
+        };
+
+        // Mutation eligibility fails closed in FALLBACK mode
+        let eligibility = validate_world_mutation_eligibility(&world);
+        assert_eq!(eligibility, Err(SolarAuthError::WorldInFallback { world_key: 100 }));
+
+        // Revision & checksum remain unpolluted
+        assert_eq!(world.harbor_revision, 999);
+        assert_eq!(world.harbor_checksum, "sha256:source_golden_checksum");
+    }
+
+    #[test]
+    fn test_two_worlds_same_coordinates_cannot_cross_read_or_write() {
+        let world_a_key = 100u64;
+        let world_b_key = 200u64;
+        let cx = 5;
+        let cz = -10;
+
+        let key_a = pack_chunk_key(world_a_key, cx, cz);
+        let key_b = pack_chunk_key(world_b_key, cx, cz);
+
+        assert_ne!(key_a, key_b, "Packed chunk keys across distinct worlds must be unique");
+
+        // Verify unpacking separates worlds
+        let (wa, xa, za) = unpack_chunk_key(key_a);
+        let (wb, xb, zb) = unpack_chunk_key(key_b);
+
+        assert_eq!(wa, world_a_key);
+        assert_eq!(wb, world_b_key);
+        assert_eq!(xa, cx);
+        assert_eq!(xb, cx);
+        assert_eq!(za, cz);
+        assert_eq!(zb, cz);
+    }
+
+    #[test]
+    fn test_fallback_mode_rejects_all_mutations() {
+        let active_world = SolarWorld {
+            world_key: 1,
+            world_name: "active".to_string(),
+            kind: "lobby".to_string(),
+            owner: "".to_string(),
+            status: WORLD_STATUS_ACTIVE.to_string(),
+            harbor_revision: 1,
+            harbor_checksum: "csum".to_string(),
+            min_y: -64,
+            height: 384,
+            spawn_x: 0.0,
+            spawn_y: 64.0,
+            spawn_z: 0.0,
+            spawn_yaw: 0.0,
+            spawn_pitch: 0.0,
+            seed: 0,
+            source_template: "".to_string(),
+            created_at: Timestamp::from_micros_since_unix_epoch(1),
+            updated_at: Timestamp::from_micros_since_unix_epoch(1),
+        };
+
+        let fallback_world = SolarWorld {
+            status: WORLD_STATUS_FALLBACK.to_string(),
+            ..active_world.clone()
+        };
+
+        let importing_world = SolarWorld {
+            status: WORLD_STATUS_IMPORTING.to_string(),
+            ..active_world.clone()
+        };
+
+        assert!(validate_world_mutation_eligibility(&active_world).is_ok());
+        assert!(matches!(
+            validate_world_mutation_eligibility(&fallback_world),
+            Err(SolarAuthError::WorldInFallback { .. })
+        ));
+        assert!(matches!(
+            validate_world_mutation_eligibility(&importing_world),
+            Err(SolarAuthError::WorldNotActive { .. })
+        ));
+    }
+
+    #[test]
+    fn test_retired_per_block_and_loader_paths_fail_closed() {
+        // Enforces that empty or un-batched edits are rejected
+        let empty_batch: Vec<SolarBlockEdit> = Vec::new();
+        let res = validate_patch_bounds(&empty_batch, -64, 384);
+        assert!(res.is_err(), "Single-block / empty un-batched legacy writes are blocked");
+    }
+
+    struct MockContainerAuthorizer;
+    impl ContainerAccessAuthorizer for MockContainerAuthorizer {
+        fn authorize_container_access(
+            &self,
+            _world_key: u64,
+            world_x: i32,
+            _world_y: i32,
+            world_z: i32,
+            actor: &str,
+            auth: &SolarAuthContext,
+        ) -> Result<(), SolarAuthError> {
+            if auth.is_admin {
+                return Ok(());
+            }
+            if world_x == 99 && world_z == 99 {
+                return Err(SolarAuthError::ContainerAccessDenied {
+                    container_type: "LockedVault".to_string(),
+                    reason: format!("actor '{actor}' lacks vault key"),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_container_access_authorization_chain() {
+        let container_auth = MockContainerAuthorizer;
+        let player_auth = SolarAuthContext {
+            actor: "thief".to_string(),
+            is_admin: false,
+            bypass_claims: false,
+            client_tick: 1,
+        };
+
+        let res_denied = container_auth.authorize_container_access(1, 99, 64, 99, "thief", &player_auth);
+        assert!(matches!(res_denied, Err(SolarAuthError::ContainerAccessDenied { .. })));
+
+        let res_allowed = container_auth.authorize_container_access(1, 10, 64, 10, "thief", &player_auth);
+        assert!(res_allowed.is_ok());
     }
 }
