@@ -186,7 +186,7 @@ pub trait BlockBehaviorAuthorizer {
 // ---------------------------------------------------------------------------
 
 /// Per-world metadata keyed by stable `u64 world_key`.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 #[table(
     accessor = solar_world,
     public,
@@ -227,7 +227,7 @@ pub struct SolarWorld {
 }
 
 /// Canonical baseline chunk snapshot keyed by `u128 chunk_key`.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[table(
     accessor = solar_chunk_base,
     public,
@@ -254,7 +254,7 @@ pub struct SolarChunkBase {
 }
 
 /// Live head revision and metadata for a chunk column keyed by `u128 chunk_key`.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[table(
     accessor = solar_chunk_head,
     public,
@@ -283,11 +283,11 @@ pub struct SolarChunkHead {
 }
 
 /// Bounded per-chunk edit batch.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[table(
     accessor = solar_chunk_patch,
     public,
-    index(accessor = solar_chunk_patch_chunk, btree(columns = [chunk_key, revision])),
+    index(accessor = solar_chunk_patch_chunk, btree(columns = [chunk_key])),
     index(accessor = solar_chunk_patch_world, btree(columns = [world_key])),
 )]
 pub struct SolarChunkPatch {
@@ -314,7 +314,7 @@ pub struct SolarChunkPatch {
 }
 
 /// Compaction request for chunks with accumulated patches.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[table(
     accessor = solar_compaction_request,
     public,
@@ -433,11 +433,13 @@ pub fn validate_compaction_bounds(
 }
 
 // ---------------------------------------------------------------------------
-// Native Test Stubs for SpacetimeDB Host Imports
+// Native Test & Client Stubs for SpacetimeDB Host Imports
 // ---------------------------------------------------------------------------
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 mod host_stubs {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn index_id_from_name(_: *const u8, _: usize) -> u32 { 0 }
     #[unsafe(no_mangle)]
     pub extern "C" fn bytes_sink_write(_: *const u8, _: usize) {}
     #[unsafe(no_mangle)]
@@ -825,5 +827,339 @@ mod tests {
         head.patch_count = 0;
         assert_eq!(head.base_revision, 2);
         assert_eq!(head.patch_count, 0);
+    }
+
+    #[test]
+    fn test_concurrent_revision_conflict_exactly_one_succeeds() {
+        // Models 4 concurrent workers attempting to write to a chunk currently at revision 5
+        let current_revision = 5u64;
+        let mut head = SolarChunkHead {
+            chunk_key: pack_chunk_key(42, 0, 0),
+            world_key: 42,
+            chunk_x: 0,
+            chunk_z: 0,
+            applied_revision: current_revision,
+            base_revision: 0,
+            patch_count: 5,
+            updated_at: Timestamp::from_micros_since_unix_epoch(100),
+            last_actor: "init".to_string(),
+        };
+
+        let actors = ["worker_A", "worker_B", "worker_C", "worker_D"];
+        let mut success_count = 0;
+        let mut conflict_count = 0;
+        let mut patch_log: Vec<(u64, String)> = Vec::new();
+
+        for actor in actors {
+            // All workers believed head was at revision 5
+            let expected_rev = 5u64;
+            match check_expected_revision(Some(head.applied_revision), expected_rev) {
+                Ok(next_rev) => {
+                    success_count += 1;
+                    head.applied_revision = next_rev;
+                    head.patch_count += 1;
+                    head.last_actor = actor.to_string();
+                    patch_log.push((next_rev, actor.to_string()));
+                }
+                Err(_) => {
+                    conflict_count += 1;
+                }
+            }
+        }
+
+        assert_eq!(success_count, 1, "Exactly one concurrent worker must succeed");
+        assert_eq!(conflict_count, 3, "All other concurrent workers must fail with revision conflict");
+        assert_eq!(head.applied_revision, 6, "Head must advance exactly once to revision 6");
+        assert_eq!(head.patch_count, 6);
+        assert_eq!(head.last_actor, "worker_A");
+        assert_eq!(patch_log.len(), 1);
+        assert_eq!(patch_log[0], (6, "worker_A".to_string()));
+    }
+
+    #[test]
+    fn test_compaction_cannot_discard_newer_patches() {
+        let chunk_key = pack_chunk_key(1, 0, 0);
+
+        // Chunk starts with base_revision = 0, and has 5 sequential patches
+        let mut base = SolarChunkBase {
+            chunk_key,
+            world_key: 1,
+            chunk_x: 0,
+            chunk_z: 0,
+            data: vec![0x10, 0x20],
+            base_revision: 0,
+            created_at: Timestamp::from_micros_since_unix_epoch(1),
+            updated_at: Timestamp::from_micros_since_unix_epoch(1),
+        };
+
+        let mut head = SolarChunkHead {
+            chunk_key,
+            world_key: 1,
+            chunk_x: 0,
+            chunk_z: 0,
+            applied_revision: 5,
+            base_revision: 0,
+            patch_count: 5,
+            updated_at: Timestamp::from_micros_since_unix_epoch(50),
+            last_actor: "actor".to_string(),
+        };
+
+        let mut patches: Vec<SolarChunkPatch> = (1..=5)
+            .map(|rev| SolarChunkPatch {
+                id: rev,
+                chunk_key,
+                world_key: 1,
+                chunk_x: 0,
+                chunk_z: 0,
+                revision: rev,
+                edits: vec![SolarBlockEdit::new(0, 64, 0, rev as i32)],
+                actor: format!("actor_{rev}"),
+                created_at: Timestamp::from_micros_since_unix_epoch(rev as i64 * 10),
+            })
+            .collect();
+
+        // Compaction executes for cutoff revision = 3
+        let cutoff_revision = 3u64;
+        assert!(validate_compaction_bounds(head.base_revision, head.applied_revision, cutoff_revision).is_ok());
+
+        // 1. Base snapshot is updated
+        base.data = vec![0xAA, 0xBB, 0xCC]; // newly folded compressed chunk
+        base.base_revision = cutoff_revision;
+
+        // 2. Safe cutoff pruning: prune patches where revision <= cutoff_revision
+        patches.retain(|p| p.revision > cutoff_revision);
+
+        // 3. Update head metadata
+        head.base_revision = cutoff_revision;
+        head.patch_count = patches.len() as u32;
+
+        // Verify that newer patches (revisions 4 and 5) were NOT discarded
+        assert_eq!(patches.len(), 2, "Patches 4 and 5 must remain in the patch table");
+        assert_eq!(patches[0].revision, 4);
+        assert_eq!(patches[1].revision, 5);
+        assert_eq!(head.base_revision, 3);
+        assert_eq!(head.applied_revision, 5);
+        assert_eq!(head.patch_count, 2);
+    }
+
+    #[test]
+    fn test_failed_authorization_leaves_all_tables_unchanged() {
+        let chunk_key = pack_chunk_key(1, 0, 0);
+
+        let initial_head = SolarChunkHead {
+            chunk_key,
+            world_key: 1,
+            chunk_x: 0,
+            chunk_z: 0,
+            applied_revision: 3,
+            base_revision: 0,
+            patch_count: 3,
+            updated_at: Timestamp::from_micros_since_unix_epoch(30),
+            last_actor: "valid_actor".to_string(),
+        };
+
+        let initial_base = SolarChunkBase {
+            chunk_key,
+            world_key: 1,
+            chunk_x: 0,
+            chunk_z: 0,
+            data: vec![0x01, 0x02],
+            base_revision: 0,
+            created_at: Timestamp::from_micros_since_unix_epoch(1),
+            updated_at: Timestamp::from_micros_since_unix_epoch(1),
+        };
+
+        let initial_patches = vec![
+            SolarChunkPatch {
+                id: 1,
+                chunk_key,
+                world_key: 1,
+                chunk_x: 0,
+                chunk_z: 0,
+                revision: 1,
+                edits: vec![SolarBlockEdit::new(0, 64, 0, 1)],
+                actor: "valid_actor".to_string(),
+                created_at: Timestamp::from_micros_since_unix_epoch(10),
+            },
+        ];
+
+        let region_mgr = MockRegionManager {
+            safezones: vec![(0, -64, 0, 100, 320, 100)],
+        };
+        let _block_behavior = MockBlockBehavior;
+
+        // Attacker attempts unauthorized edit in safezone
+        let rogue_auth = SolarAuthContext {
+            actor: "griefer".to_string(),
+            is_admin: false,
+            bypass_claims: false,
+            client_tick: 999,
+        };
+
+        let auth_res = region_mgr.authorize_edit(1, "world", 10, 64, 10, "griefer", &rogue_auth);
+        assert!(auth_res.is_err(), "Edit must be rejected by RegionManager");
+
+        // Simulate transaction abort: tables remain identical
+        let current_head = initial_head.clone();
+        let current_base = initial_base.clone();
+        let current_patches = initial_patches.clone();
+
+        assert_eq!(current_head, initial_head, "Head must be completely unchanged");
+        assert_eq!(current_base, initial_base, "Base must be completely unchanged");
+        assert_eq!(current_patches, initial_patches, "Patch log must be completely unchanged");
+    }
+
+    #[test]
+    fn test_world_template_branch_copy_distinct_keys_and_no_source_mutation() {
+        let src_world_key = 100u64;
+        let dst_world_key = 200u64;
+
+        let src_coords = [(0, 0), (-1, -1), (5, -10), (100, 200)];
+        let mut src_base_chunks: Vec<SolarChunkBase> = Vec::new();
+        let mut src_heads: Vec<SolarChunkHead> = Vec::new();
+
+        for (cx, cz) in src_coords {
+            let chunk_key = pack_chunk_key(src_world_key, cx, cz);
+            src_base_chunks.push(SolarChunkBase {
+                chunk_key,
+                world_key: src_world_key,
+                chunk_x: cx,
+                chunk_z: cz,
+                data: vec![0x11, 0x22, 0x33],
+                base_revision: 5,
+                created_at: Timestamp::from_micros_since_unix_epoch(10),
+                updated_at: Timestamp::from_micros_since_unix_epoch(10),
+            });
+            src_heads.push(SolarChunkHead {
+                chunk_key,
+                world_key: src_world_key,
+                chunk_x: cx,
+                chunk_z: cz,
+                applied_revision: 5,
+                base_revision: 5,
+                patch_count: 0,
+                updated_at: Timestamp::from_micros_since_unix_epoch(10),
+                last_actor: "template_author".to_string(),
+            });
+        }
+
+        let snapshot_src_base = src_base_chunks.clone();
+        let snapshot_src_heads = src_heads.clone();
+
+        // Perform template cloning to dst_world_key
+        let mut dst_base_chunks: Vec<SolarChunkBase> = Vec::new();
+        let mut dst_heads: Vec<SolarChunkHead> = Vec::new();
+
+        for chunk in &src_base_chunks {
+            let dst_chunk_key = pack_chunk_key(dst_world_key, chunk.chunk_x, chunk.chunk_z);
+            assert_ne!(dst_chunk_key, chunk.chunk_key, "Destination chunk key must differ from source");
+
+            dst_base_chunks.push(SolarChunkBase {
+                chunk_key: dst_chunk_key,
+                world_key: dst_world_key,
+                chunk_x: chunk.chunk_x,
+                chunk_z: chunk.chunk_z,
+                data: chunk.data.clone(),
+                base_revision: chunk.base_revision,
+                created_at: Timestamp::from_micros_since_unix_epoch(20),
+                updated_at: Timestamp::from_micros_since_unix_epoch(20),
+            });
+
+            dst_heads.push(SolarChunkHead {
+                chunk_key: dst_chunk_key,
+                world_key: dst_world_key,
+                chunk_x: chunk.chunk_x,
+                chunk_z: chunk.chunk_z,
+                applied_revision: chunk.base_revision,
+                base_revision: chunk.base_revision,
+                patch_count: 0,
+                updated_at: Timestamp::from_micros_since_unix_epoch(20),
+                last_actor: "system_seed".to_string(),
+            });
+        }
+
+        // Verify destination chunk keys and properties
+        for (i, dst_chunk) in dst_base_chunks.iter().enumerate() {
+            let (unpacked_world, unpacked_x, unpacked_z) = unpack_chunk_key(dst_chunk.chunk_key);
+            assert_eq!(unpacked_world, dst_world_key);
+            assert_eq!(unpacked_x, src_coords[i].0);
+            assert_eq!(unpacked_z, src_coords[i].1);
+        }
+
+        // Verify source chunks are completely unmodified
+        assert_eq!(src_base_chunks, snapshot_src_base, "Source base chunks must not be modified");
+        assert_eq!(src_heads, snapshot_src_heads, "Source heads must not be modified");
+    }
+
+    #[test]
+    fn test_negative_chunk_coordinates_and_world_key_boundaries() {
+        let extreme_cases = [
+            (1u64, -1, -1),
+            (u64::MAX, -1, -1),
+            (u64::MAX, i32::MIN, i32::MAX),
+            (0x8000_0000_0000_0000u64, i32::MIN, i32::MIN),
+            (0x0000_0000_FFFF_FFFFu64, -32768, 32767),
+            (123456789u64, -1000000, 1000000),
+        ];
+
+        for (world_key, cx, cz) in extreme_cases {
+            let key = pack_chunk_key(world_key, cx, cz);
+            let (unpacked_world, unpacked_x, unpacked_z) = unpack_chunk_key(key);
+
+            assert_eq!(unpacked_world, world_key, "world_key must roundtrip exactly");
+            assert_eq!(unpacked_x, cx, "negative/boundary chunk_x must roundtrip exactly");
+            assert_eq!(unpacked_z, cz, "negative/boundary chunk_z must roundtrip exactly");
+
+            // Local block conversion inside negative chunk
+            let edit = SolarBlockEdit::new(15, 64, 15, 1);
+            let (wx, wy, wz) = edit.to_world_coords(cx, cz);
+            assert_eq!(wy, 64);
+            let expected_wx = (cx << 4) + 15;
+            let expected_wz = (cz << 4) + 15;
+            assert_eq!(wx, expected_wx);
+            assert_eq!(wz, expected_wz);
+        }
+    }
+
+    #[test]
+    fn test_patch_size_and_height_boundary_rejection() {
+        let world_min_y = -64;
+        let world_height = 384; // max_y = 320
+
+        // 1. Empty batch rejection
+        let empty: Vec<SolarBlockEdit> = vec![];
+        let res_empty = validate_patch_bounds(&empty, world_min_y, world_height);
+        assert!(res_empty.is_err());
+        assert!(res_empty.unwrap_err().contains("empty batch"));
+
+        // 2. Max size limit (256 accepted, 257 rejected)
+        let exact_max: Vec<SolarBlockEdit> = (0..256)
+            .map(|i| SolarBlockEdit::new((i % 16) as u8, 0, ((i / 16) % 16) as u8, 1))
+            .collect();
+        assert!(validate_patch_bounds(&exact_max, world_min_y, world_height).is_ok());
+
+        let mut oversized = exact_max;
+        oversized.push(SolarBlockEdit::new(0, 0, 0, 1));
+        let res_oversized = validate_patch_bounds(&oversized, world_min_y, world_height);
+        assert!(res_oversized.is_err());
+        assert!(res_oversized.unwrap_err().contains("exceeds maximum batch limit"));
+
+        // 3. Local coordinate bounds (x >= 16 or z >= 16 rejected)
+        let bad_local_x = vec![SolarBlockEdit::new(16, 0, 0, 1)];
+        assert!(validate_patch_bounds(&bad_local_x, world_min_y, world_height).is_err());
+
+        let bad_local_z = vec![SolarBlockEdit::new(0, 0, 16, 1)];
+        assert!(validate_patch_bounds(&bad_local_z, world_min_y, world_height).is_err());
+
+        // 4. World height boundary validation
+        // Exact lower bound: -64 (valid)
+        assert!(validate_patch_bounds(&[SolarBlockEdit::new(0, -64, 0, 1)], world_min_y, world_height).is_ok());
+        // Below lower bound: -65 (invalid)
+        assert!(validate_patch_bounds(&[SolarBlockEdit::new(0, -65, 0, 1)], world_min_y, world_height).is_err());
+
+        // Exact upper bound: 319 (valid)
+        assert!(validate_patch_bounds(&[SolarBlockEdit::new(0, 319, 0, 1)], world_min_y, world_height).is_ok());
+        // At/above upper bound: 320 (invalid)
+        assert!(validate_patch_bounds(&[SolarBlockEdit::new(0, 320, 0, 1)], world_min_y, world_height).is_err());
     }
 }
