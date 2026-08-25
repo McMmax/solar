@@ -1,11 +1,11 @@
-# Solar per-chunk byte format (`data` in `solar_chunk`)
+# Solar per-chunk byte format (`data` in `solar_chunk_base`)
 
-The Solar sibling to Polar's `FORMAT.md`, but **per-chunk** (independently (de)serializable — the thing Polar can't do). One `solar_chunk.data` blob = one chunk column. Produced/consumed JVM-side from Minestom `Palette`; opaque to the SpacetimeDB module.
+The Solar sibling to Polar's `FORMAT.md`, but **per-chunk** (independently (de)serializable — the thing Polar can't do). One `solar_chunk_base.data` blob = one baseline chunk column snapshot. Produced/consumed JVM-side from Minestom `Palette`; opaque to the SpacetimeDB module.
 
-Status: **spec / draft** — finalize during S2 (codec implementation) and copy to `Solar/FORMAT.md` (root) as the canonical version.
+Status: **v1 specification**
 
 ## Goals
-- Independently (de)serializable per chunk (one DB row each).
+- Independently (de)serializable per chunk (keyed by `chunk_key: u128`).
 - Tiny: palette-compressed, **no lighting** (recomputed on load), empty sections dropped, optional zstd wrapper.
 - Version-stable (a `version` byte; reader switches on it).
 - Cheap to encode/decode: bulk-copy Minestom `Palette` arrays, no per-block iteration.

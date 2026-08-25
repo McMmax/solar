@@ -1,6 +1,6 @@
-# Solar — architecture
+# Solar — Architecture (Solar v1)
 
-## The split
+## The Split
 ```
             players (vanilla MC clients)
                      │
@@ -8,56 +8,113 @@
               │  Minestom    │  (Stomzy fork)
               │  (JVM)       │
               │  SolarLoader │  loadChunk()  ←─ stream chunks
-              │  write hook  │  block edits  ─→
+              │  write hook  │  bounded edit batches  ─→
               └──────┬───────┘
                      │ Panama/FFM (jextract)
               ┌──────▼───────┐  one connection per server
               │ solar-bridge │  (Rust, spacetimedb-sdk)
-              │ (native)     │  reads SDK cache / calls reducers
+              │ (native)     │  O(1) SDK cache lookup / oneway reducers
               └──────┬───────┘
                      │ WebSocket (subscriptions + reducer calls)
-              ┌──────▼───────┐  store + delta bus + persistence
-              │ SpacetimeDB  │  (cruiser module; solar-schema tables)
-              │  solar_chunk │  NOT a simulator
-              │  solar_block_set
-              │  solar_world │
-              └──────────────┘
+              ┌──────▼───────────────────────────────────┐  store + delta bus + persistence
+              │ SpacetimeDB 2.8.2 (Hot module)           │  NOT a simulator
+              │  solar_world                             │
+              │  solar_chunk_base                        │
+              │  solar_chunk_head                        │
+              │  solar_chunk_patch (bounded batches)     │
+              │  solar_compaction_request                │
+              └──────────────────────────────────────────┘
 ```
 
-**Authority:** Minestom owns gameplay/physics/rendering. SpacetimeDB only stores chunks, broadcasts block deltas between instances, and persists edits. This is the deliberate opposite of Clockwork's `spacetimedb-minecraft` (whole sim in reducers) — ours is lighter and keeps tick latency off the network.
+**Authority:** Minestom owns gameplay, physics, and rendering. SpacetimeDB stores chunks, broadcasts bounded block deltas between instances, and persists edits atomically.
 
-## Data model (`solar-schema`, live in the `cruiser` DB)
-- **`solar_chunk`** — canonical per-chunk column state. One row per `(world_id, chunk_x, chunk_z)` (uniqueness enforced by the upsert reducer; btree index `solar_chunk_loc`). Fields: `id u64 auto_inc` PK, `world_id`, `chunk_x`, `chunk_z`, `data: Vec<u8>` (Solar per-chunk bytes — see FORMAT.md), `rev: u64` (bumped each write), `updated_at`.
-- **`solar_block_set`** — live block-edit delta log (Clockwork `StdbBlockSetUpdate` analogue). Fields: `id u64 auto_inc` PK, `world_id`, `chunk_x`, `chunk_z` (derived `x>>4`/`z>>4`), `x`,`y`,`z`, `state: i32` (Minestom state id), `actor`, `at`; btree `solar_block_loc`.
-- **`solar_world`** — per-world metadata. PK `world_id`; `kind` (lobby|practice_template|island), `owner` (team), `min_y`, `height`, `spawn_*`, `seed`, `source_template`, `created_at`.
+---
 
-### Reducers (the framework API; in the cruiser module `reducers/solar.rs`)
-- `solar_chunk_put(world_id, chunk_x, chunk_z, data)` — upsert one chunk, bump `rev`.
-- `solar_block_set_apply(world_id, x, y, z, state, actor)` — append one delta (chunk coords derived).
-- `solar_block_prune(world_id, chunk_x, chunk_z, up_to_id)` — drop deltas folded into the chunk.
-- `solar_world_upsert(world_id, kind, owner, min_y, height, spawn_x..pitch, seed, source_template)`.
-- `solar_seed_from_template(src_world_id, dst_world_id, owner)` — copy a template's chunk rows + meta into a new world.
+## Why the Experimental Model was Replaced
 
-## Why these shapes (research-backed)
-1. **Per-chunk rows, not a blob.** Polar can't slice; a monolithic ~196 KB blob *would not sync over a SpacetimeDB subscription* (empirically) though it returned via one-off HTTP SQL. Per-chunk rows are tiny, sync cleanly, and allow on-demand/region loading. Clockwork's `StdbChunk` is the same shape.
-2. **Delta log + compaction, not whole-chunk rewrites per edit.** Editing a chunk by rewriting its whole row on every block change is wasteful and noisy across instances. `solar_block_set` carries single-block edits as small rows (cheap to broadcast); they fold into `solar_chunk` periodically (`solar_chunk_put` + `solar_block_prune`).
-3. **Minestom-authoritative.** STDB reducers at ~20 Hz/player with a network round-trip per move would be heavy; keeping sim in Minestom and using STDB as store/bus is the right cost profile (and is what the user wants: "JVM retrieves chunks and renders them; JVM sends block updates").
-4. **One native connection per server.** SpacetimeDB's Rust SDK keeps a local cache fed by subscriptions; `solar-bridge` reads that cache in-process (zero round-trip per chunk) and writes via oneway reducer calls — reusing the existing `minestom_stdb_bridge` connection rather than opening a second one.
+The experimental Solar prototype had several critical architectural flaws that degraded performance at multi-instance scale:
 
-## Components
-- **`solar-bridge` (native, S1):** FFI `solar_subscribe(world_id)`, `solar_get_world_chunk(world_id,cx,cz,cb)` (cache read → bytes), `solar_world_chunk_put_oneway`, `solar_block_set_apply_oneway`. Modeled on `Stomzy/spacetime/native/src/hub.rs` (`minestom_client_get_polar_world_data`, the `*_oneway` reducers, the `calculate_knockback` cache-read). Needs the cruiser DB's generated Rust client (regenerated to include the solar tables/reducers).
-- **`SolarLoader` (JVM, S2):** implements Minestom `ChunkLoader`. `loadChunk` → `SolarTransport.getChunk` → `SolarReader` → `LightingChunk` (null → generator). `saveChunk` → `SolarWriter` → `solar_chunk_put`. `supportsParallelLoading()=true`. Read-only vs editable flag.
-- **`SolarTransport` (JVM, S2):** Panama bindings to `solar-bridge` + per-world subscription lifecycle + the `InstanceBlockUpdateEvent` write hook.
-- **Per-chunk codec (JVM, S2):** `SolarReader`/`SolarWriter` over Minestom `Palette` (`load(int[],long[])` + a raw-palette getter). See FORMAT.md.
+1. **Linear Cache Scans (Lack of Single-Column PK)**:
+   SpacetimeDB client SDKs generate in-memory index accessors solely for single-column primary keys. The prototype used an auto-incrementing `id: u64` PK with a composite B-Tree index on `(world_id, chunk_x, chunk_z)`. Because client-side caches could not index on composite keys, every `loadChunk()` cache lookup required an **$O(N)$ linear iteration** across every chunk in the subscribed world.
 
-## Integration points (existing repos)
-- **cruiser module** (`Spacetime/spacetimedb`): already re-exports `solar-schema` + mounts reducers (S0 done).
-- **Stomzy native bridge** (`Stomzy/spacetime/native` + `stdb` generated client): S1 adds Solar FFI + regenerates the client bindings; **both jextract include-lists** (`generate_java.bat` AND the `Stomzy/Dockerfile` RUN block) must stay in sync.
-- **Stomzy build** (`gradle/libs.versions.toml`, `build.gradle.kts`): add `solar` like `polar`; Dockerfile builds `Solar/native` + jextract + drops the `.so`.
-- **Lobby** (`Stomzy/demo/.../PlayerInit.java`): untouched — keeps Polar.
+2. **One-Row-Per-Block Table Explosion (`solar_block_set`)**:
+   Storing single block edits as individual rows caused massive row count explosion in SpacetimeDB's in-memory RAM. Multi-block operations (WorldEdit, explosions, excavation) generated thousands of individual transactions and WebSocket update broadcasts.
 
-## Constraints to respect
-- SpacetimeDB holds **all data in RAM** (≈ host RAM) → bound world sizes, compress chunk blobs, prune empties.
-- **32 MiB** WebSocket message ceiling → per-chunk rows are fine, but a whole-world initial subscription snapshot is the sum of its chunk rows; very large worlds need **region/windowed subscriptions** (OPTIMIZATION.md).
-- Reducers are deterministic/transactional (no IO, `ctx.rng` only) — keep them pure; all game logic stays JVM-side.
-- Never block the game tick on STDB I/O — all reads come from the local cache, all writes are oneway on a worker thread.
+3. **Lack of Atomic Revision Gating**:
+   The prototype lacked expected-revision validation during delta writes, leading to silent race conditions and lost updates when multiple instances or asynchronous workers modified adjacent chunk areas.
+
+4. **String World Identifier Overhead**:
+   Using `String world_id` created continuous heap allocations, inflated memory footprints, and slowed key comparisons.
+
+---
+
+## Bounded Solar v1 Data Model (`solar-schema`)
+
+Solar v1 replaces the experimental schema with a bounded, single-column primary key architecture:
+
+### Key Packing Formula
+Every chunk is uniquely addressed across all worlds by a packed 128-bit integer:
+```text
+chunk_key = (world_key << 64) | ((chunk_x as u32) << 32) | (chunk_z as u32)
+```
+- **Bits 64..127**: Stable numeric `world_key: u64`.
+- **Bits 32..63**: Chunk column coordinate `chunk_x: i32` cast to `u32`.
+- **Bits 0..31**: Chunk column coordinate `chunk_z: i32` cast to `u32`.
+
+This allows instant **$O(1)$ primary-key lookups** in SpacetimeDB table indices and client-side SDK memory caches.
+
+---
+
+### Tables
+
+1. **`solar_world`** (Accessor: `solar_world`)
+   - Primary Key: `world_key: u64`
+   - Fields: `world_name`, `kind`, `owner`, `min_y`, `height`, `spawn_x..z`, `spawn_yaw`, `spawn_pitch`, `seed`, `source_template`, `created_at`, `updated_at`.
+   - Index: B-Tree on `world_name`.
+
+2. **`solar_chunk_base`** (Accessor: `solar_chunk_base`)
+   - Primary Key: `chunk_key: u128`
+   - Fields: `world_key`, `chunk_x`, `chunk_z`, `data: Vec<u8>` (palette-compressed chunk sections), `base_revision: u64`, `created_at`, `updated_at`.
+   - Index: B-Tree on `world_key`.
+
+3. **`solar_chunk_head`** (Accessor: `solar_chunk_head`)
+   - Primary Key: `chunk_key: u128`
+   - Fields: `world_key`, `chunk_x`, `chunk_z`, `applied_revision: u64`, `base_revision: u64`, `patch_count: u32`, `updated_at`, `last_actor: String`.
+   - Index: B-Tree on `world_key`.
+
+4. **`solar_chunk_patch`** (Accessor: `solar_chunk_patch`)
+   - Primary Key: `id: u64` (`#[auto_inc]`)
+   - Fields: `chunk_key: u128`, `world_key: u64`, `chunk_x: i32`, `chunk_z: i32`, `revision: u64`, `edits: Vec<SolarBlockEdit>`, `actor: String`, `created_at: Timestamp`.
+   - Limit: Bounded batch size (`MAX_EDITS_PER_PATCH = 256`).
+   - Indices: B-Tree on `(chunk_key, revision)`, B-Tree on `world_key`.
+
+5. **`solar_compaction_request`** (Accessor: `solar_compaction_request`)
+   - Primary Key: `chunk_key: u128`
+   - Fields: `world_key`, `chunk_x`, `chunk_z`, `head_revision: u64`, `patch_count: u32`, `status: String`, `requested_at`, `requested_by`.
+   - Threshold: Automatically triggers when `patch_count >= 64`.
+
+---
+
+## Reducers & State Transitions
+
+- **`solar_world_upsert`**: Registers or updates world metadata keyed by `world_key`.
+- **`solar_chunk_base_commit`**: Commits an authoritative base chunk blob and synchronizes `solar_chunk_head`.
+- **`solar_chunk_apply_patch`**:
+  1. Validates bounded edit limits (`1 <= edits.len() <= 256`) and coordinate ranges.
+  2. Evaluates `RegionManagerAuthorizer` and `BlockBehaviorAuthorizer` authorization hooks.
+  3. Validates atomic expected revision (`applied_revision == expected_revision`).
+  4. Appends `SolarChunkPatch` and advances `solar_chunk_head.applied_revision`.
+  5. Auto-queues `SolarCompactionRequest` if `patch_count >= 64`.
+- **`solar_compaction_request_submit`**: Manually or automatically flags a chunk for compaction.
+- **`solar_compaction_complete`**: Replaces `solar_chunk_base.data`, updates `base_revision`, prunes folded patches with `revision <= compacted_up_to_revision`, and recalculates remaining patch counts.
+- **`solar_seed_from_template`**: Clones baseline chunk blobs from template worlds to new world instances.
+
+---
+
+## Authorization Integration
+
+Solar v1 exposes explicit authorization hooks:
+- **`RegionManagerAuthorizer`**: Enforces claim boundaries, safezone rules, and build permissions.
+- **`BlockBehaviorAuthorizer`**: Validates block state transitions and prevents unauthorized state modifications.
+
+Both hooks accept `SolarAuthContext { actor, is_admin, bypass_claims, client_tick }`. Admin callers and bypass flags allow privileged execution while standard edits are validated prior to any state mutation.

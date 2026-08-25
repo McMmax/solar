@@ -17,37 +17,37 @@ Solar must stay cheap at **multi-instance, many-player** scale against a Spaceti
 
 ## 1. Storage / row-size (biggest RAM lever)
 **Do:**
-- **One row per chunk column**, never a whole-world blob. (Blob = the bug we already hit; it won't even sync.)
+- **One row per chunk column in `solar_chunk_base`**, keyed by `chunk_key: u128` (packed `(world_key << 64) | ((chunk_x as u32) << 32) | (chunk_z as u32)`).
 - **Drop fully-air chunks** — return `null` from `loadChunk` so Minestom's `Generator` makes void/flat; store nothing.
 - **Omit empty sections** in the Solar format (the `[present]` flag per section). A mostly-empty island chunk should be a few hundred bytes.
 - **Don't store lighting.** Recompute on load via `LightingChunk` (Stomzy already has native light compute). Saves ~4 KB/section (2048 B sky + 2048 B block). Stored light is the single largest avoidable cost.
-- **zstd-compress the `data` blob** before `solar_chunk_put` (Polar does this). Minestom palettes are already bit-packed, but zstd on the packed `long[]` + palette gives a further win for repetitive terrain. Compress/decompress on a **worker thread**, never the tick. (Trade: CPU for RAM/bandwidth — worth it since RAM is the scarce resource.)
+- **zstd-compress the `data` blob** before `solar_chunk_base_commit`. Minestom palettes are already bit-packed, but zstd on the packed `long[]` + palette gives a further win for repetitive terrain. Compress/decompress on a **worker thread**, never the tick.
 - **Biomes only when non-default**; **block entities only when present** (NBT), behind presence flags.
 **Don't:**
-- Don't store per-block rows (millions of rows; index + overhead explosion).
+- Don't store unbatched per-block rows (row count & index explosion in RAM).
 - Don't store heightmaps/light you can recompute.
-- Don't keep a parallel on-disk world "just in case" — the point is no disk.
+- Don't use linear cache scans on client reads.
 
-## 2. Write path (edits) — deltas, not rewrites
+## 2. Write path (edits) — bounded batches & atomic revision checks
 **Do:**
-- **Live edits → `solar_block_set`** (one tiny row), NOT a whole-chunk `solar_chunk_put`. This is the cross-instance propagation path; rows are small and STDB ships only the delta.
-- **Coalesce per tick:** mark dirty chunks on `InstanceBlockUpdateEvent`; flush at most once per tick per chunk. A player spamming blocks in one tick = one flush, many deltas batched.
-- **Batch bursts:** for WorldEdit-style / fast multi-block ops, add a `solar_block_set_batch(world_id, Vec<edit>)` reducer to avoid one reducer call (one transaction + broadcast) per block. Each reducer call is a transaction — minimize transaction count.
-- **Compaction is amortized:** fold `solar_block_set` → `solar_chunk` (`solar_chunk_put` + `solar_block_prune`) on a schedule (chunk unload, or every K seconds, or when a chunk's delta count exceeds a threshold, e.g. 256). Tune so chunk-row writes are rare and the delta log stays bounded.
+- **Live edits → `solar_chunk_patch`** (bounded batches up to `MAX_EDITS_PER_PATCH = 256`), NOT whole-chunk rewrites.
+- **Atomic expected-revision verification**: `solar_chunk_apply_patch` checks `applied_revision == expected_revision`, rejecting stale edits atomically.
+- **Authorization gating**: Call `RegionManagerAuthorizer` and `BlockBehaviorAuthorizer` before applying state mutations.
+- **Compaction lifecycle**: When `patch_count >= 64`, automatic `solar_compaction_request` triggers background folding into `solar_chunk_base` and prunes historical patches via `solar_compaction_complete`.
 - **All writes oneway + off-thread** (virtual-thread executor, like `SpaceIntegration`'s existing pattern). Fire-and-forget; never await on the tick.
 **Don't:**
-- Don't `solar_chunk_put` on every block edit (whole-row churn + re-broadcast of the full chunk).
-- Don't let the delta log grow unbounded — a **scheduled reducer** must prune as a backstop if a server dies mid-compaction.
+- Don't rewrite whole base chunks on every block edit.
+- Don't let patch logs grow unbounded without compaction thresholds.
 - Don't block the tick waiting for write acks.
 
 ## 3. Subscriptions / sync — only what a server needs
 **Do:**
-- **Dynamic per-world subscriptions:** subscribe `WHERE world_id='<id>'` when a `SolarLoader` attaches; **unsubscribe** when the world unloads (SpacetimeDB handles support runtime add/remove). This bounds a server's cache to its active worlds — *the* lever once there are many island worlds.
-- **Region / windowed subscriptions for large worlds:** instead of the whole world, subscribe to chunks near loaded areas (e.g. `WHERE world_id=… AND chunk_x BETWEEN … AND chunk_z BETWEEN …`) and shift the window as the active area moves. Avoids a huge initial snapshot (and the 32 MiB ceiling) and keeps RAM proportional to what's actually rendered. Lobby/practice/island are bounded enough to start whole-world; switch to windowed when a world's chunk count gets large.
-- **Debounce subscription churn:** don't subscribe/unsubscribe rapidly as players flicker across a boundary; add hysteresis.
-- **Rely on incremental deltas:** STDB pushes only changed rows (`solar_block_set` inserts, `solar_chunk` updates) — subscribers converge cheaply without re-reading.
+- **Dynamic per-world subscriptions:** subscribe `WHERE world_key = <key>` across `solar_world`, `solar_chunk_base`, `solar_chunk_head`, `solar_chunk_patch`, `solar_compaction_request` when a `SolarLoader` attaches; **unsubscribe** when the world unloads.
+- **O(1) in-memory lookups:** packed `u128 chunk_key` allows instant primary-key cache lookups without linear scanning.
+- **Rely on incremental deltas:** SpacetimeDB pushes only changed rows (`solar_chunk_patch` inserts, `solar_chunk_head` updates) — subscribers converge cheaply.
 **Don't:**
-- Don't subscribe to *all* worlds' chunks (`SELECT * FROM solar_chunk`) — that loads every island into every server's RAM.
+- Don't subscribe to all worlds' chunks (`SELECT * FROM solar_chunk_base`) — that loads every world into every server's RAM.
+- Don't perform O(N) client-side cache iterations.
 - Don't re-subscribe to force a refresh; the delta stream already keeps the cache live.
 
 ## 4. Read path / load — cache hits + parallelism

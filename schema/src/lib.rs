@@ -1,113 +1,829 @@
-//! Solar — SpacetimeDB world-store schema (the per-chunk sibling to Polar).
+//! Solar — SpacetimeDB 2.8.2 world-store schema (bounded per-chunk persistence model).
 //!
-//! Polar stores a world as one packed, whole-world file with no random chunk
-//! access. Solar instead stores a world as **per-chunk rows** so a JVM server can
-//! stream only the chunks it needs from SpacetimeDB, render them, and write block
-//! edits back — no world file on disk.
+//! # Architecture & Evolution
 //!
-//! This crate is the **single source of truth** for the Solar table contract. An
-//! adopting SpacetimeDB module depends on it and re-exports these `#[table]`
-//! structs from its own `tables` module so the macros register them into the
-//! module's WASM binary (same pattern as `hyperscope-schema`):
+//! The experimental Solar prototype used an auto-incrementing primary key (`id: u64`)
+//! with a composite B-Tree index on `(world_id, chunk_x, chunk_z)` for chunks, alongside
+//! an un-batched, one-row-per-block delta log (`solar_block_set`).
 //!
-//! ```ignore
-//! // <your-module>/src/tables/solar.rs
-//! pub use solar_schema::{
-//!     solar_chunk, solar_block_set, solar_world,
-//!     SolarChunk, SolarBlockSet, SolarWorld,
-//! };
+//! That experimental design had critical scalability flaws:
+//! 1. **Linear Cache Scans**: SpacetimeDB client SDKs only generate primary-key index
+//!    lookups in memory. Without a single-column primary key on chunk location, reading a
+//!    chunk from the client cache required an O(N) linear scan across all subscribed chunks.
+//! 2. **Unbounded RAM Growth**: Single-block delta rows produced massive row-count
+//!    overhead in SpacetimeDB RAM, transaction overhead per block edit, and high WebSocket
+//!    broadcast noise for multi-block operations (explosions, WorldEdit, fills).
+//! 3. **Lack of Atomic Revision Gates**: Writes lacked explicit revision fences, allowing
+//!    stale client overwrites and lost updates during concurrent edits.
+//! 4. **String World ID Overhead**: String identifiers incurred memory allocations and
+//!    expensive key comparisons across high-throughput pipelines.
+//!
+//! # Bounded Solar v1 Data Model
+//!
+//! Solar v1 introduces a bounded, single-column primary-key architecture:
+//! - **`solar_world`**: World metadata keyed by stable `u64 world_key`.
+//! - **`solar_chunk_base`**: Palette-compressed chunk snapshot keyed by `u128 chunk_key`.
+//! - **`solar_chunk_head`**: Monotonic revision tracker keyed by `u128 chunk_key`.
+//! - **`solar_chunk_patch`**: Bounded per-chunk edit batches (`MAX_EDITS_PER_PATCH = 256`).
+//! - **`solar_compaction_request`**: Compaction lifecycle tracker keyed by `u128 chunk_key`.
+//!
+//! # Key Packing
+//!
+//! Chunk keys are packed into a single `u128`:
+//! ```text
+//! chunk_key = (world_key << 64) | ((chunk_x as u32) << 32) | (chunk_z as u32)
 //! ```
-//!
-//! Reducers (the put / block-set / compact / seed logic) are **not** part of this
-//! crate — SpacetimeDB requires reducers to compile into the module crate, and
-//! they carry host concerns (auth/audit). They live in the module's
-//! `reducers::solar` and operate on these tables.
-//!
-//! Design notes:
-//!   * SpacetimeDB is the **live bus + store**, in RAM, with a 32 MiB WebSocket
-//!     message ceiling. Per-chunk rows are palette-compressed and tiny, so they
-//!     sync over subscriptions (unlike a whole-world blob, which does not).
-//!   * `solar_chunk` is the canonical state (one row per chunk column). Live
-//!     edits ride `solar_block_set` (a small delta log, like Clockwork's
-//!     `StdbBlockSetUpdate`) so peers converge without re-reading whole chunks;
-//!     deltas are periodically folded back into `solar_chunk` and pruned.
-//!   * The `data` blob is the Solar per-chunk byte format (see `FORMAT.md`),
-//!     produced/consumed JVM-side from Minestom `Palette` — opaque to the module.
+//! This provides O(1) primary-key lookups directly in SpacetimeDB and in client-side SDK caches.
 
 use spacetimedb::{table, Timestamp};
 
-/// Canonical state of one chunk column — exactly one row per
-/// `(world_id, chunk_x, chunk_z)` (uniqueness enforced by the upsert reducer,
-/// since SpacetimeDB primary keys are single-column). `data` is the Solar
-/// per-chunk serialization; `rev` bumps on every write so peers can detect
-/// staleness.
+/// Maximum block edits allowed in a single `solar_chunk_patch` batch.
+pub const MAX_EDITS_PER_PATCH: usize = 256;
+
+/// Number of active patches on a chunk before triggering automatic compaction.
+pub const COMPACTION_THRESHOLD_PATCHES: u32 = 64;
+
+/// Bit shift for the 64-bit world key in the packed 128-bit chunk key.
+pub const CHUNK_KEY_WORLD_SHIFT: u32 = 64;
+
+/// Bit shift for the 32-bit chunk X coordinate in the packed 128-bit chunk key.
+pub const CHUNK_KEY_X_SHIFT: u32 = 32;
+
+/// Bit mask for 32-bit coordinate components.
+pub const CHUNK_COORD_MASK: u128 = 0xFFFF_FFFF;
+
+/// Packs `(world_key, chunk_x, chunk_z)` into a single `u128 chunk_key`.
+///
+/// Formula: `(world_key << 64) | ((chunk_x as u32) << 32) | (chunk_z as u32)`
+#[inline]
+pub fn pack_chunk_key(world_key: u64, chunk_x: i32, chunk_z: i32) -> u128 {
+    ((world_key as u128) << CHUNK_KEY_WORLD_SHIFT)
+        | (((chunk_x as u32) as u128) << CHUNK_KEY_X_SHIFT)
+        | ((chunk_z as u32) as u128)
+}
+
+/// Unpacks a `u128 chunk_key` into `(world_key, chunk_x, chunk_z)`.
+#[inline]
+pub fn unpack_chunk_key(chunk_key: u128) -> (u64, i32, i32) {
+    let world_key = (chunk_key >> CHUNK_KEY_WORLD_SHIFT) as u64;
+    let chunk_x = ((chunk_key >> CHUNK_KEY_X_SHIFT) & CHUNK_COORD_MASK) as u32 as i32;
+    let chunk_z = (chunk_key & CHUNK_COORD_MASK) as u32 as i32;
+    (world_key, chunk_x, chunk_z)
+}
+
+/// Single block edit representation within a bounded chunk patch batch.
+#[derive(Clone, Debug, PartialEq, Eq, spacetimedb::SpacetimeType)]
+pub struct SolarBlockEdit {
+    /// Local X coordinate within the chunk (0..=15).
+    pub x: u8,
+    /// World Y coordinate (-64..=320 typical Minecraft height range).
+    pub y: i16,
+    /// Local Z coordinate within the chunk (0..=15).
+    pub z: u8,
+    /// Minecraft / Minestom block state ID.
+    pub state: i32,
+}
+
+impl SolarBlockEdit {
+    /// Constructs a new local block edit.
+    #[inline]
+    pub fn new(x: u8, y: i16, z: u8, state: i32) -> Self {
+        Self { x, y, z, state }
+    }
+
+    /// Constructs an edit by converting world coordinates to chunk-local offsets.
+    #[inline]
+    pub fn from_world_coords(world_x: i32, world_y: i32, world_z: i32, state: i32) -> Self {
+        Self {
+            x: (world_x.rem_euclid(16)) as u8,
+            y: world_y as i16,
+            z: (world_z.rem_euclid(16)) as u8,
+            state,
+        }
+    }
+
+    /// Converts local coordinates back to world coordinates given chunk coordinates.
+    #[inline]
+    pub fn to_world_coords(&self, chunk_x: i32, chunk_z: i32) -> (i32, i32, i32) {
+        (
+            (chunk_x << 4) + (self.x as i32),
+            self.y as i32,
+            (chunk_z << 4) + (self.z as i32),
+        )
+    }
+
+    /// Returns `true` if local horizontal coordinates are within `[0, 15]`.
+    #[inline]
+    pub fn is_valid_local(&self) -> bool {
+        self.x < 16 && self.z < 16
+    }
+}
+
+/// Authorization context passed to Solar mutation reducers.
+#[derive(Clone, Debug, PartialEq, Eq, spacetimedb::SpacetimeType)]
+pub struct SolarAuthContext {
+    /// Player UUID or system identity making the edit.
+    pub actor: String,
+    /// Whether the caller has administrator bypass privileges.
+    pub is_admin: bool,
+    /// Whether region claim restrictions should be bypassed.
+    pub bypass_claims: bool,
+    /// Client tick index when the edit was submitted.
+    pub client_tick: u64,
+}
+
+impl Default for SolarAuthContext {
+    fn default() -> Self {
+        Self {
+            actor: String::new(),
+            is_admin: false,
+            bypass_claims: false,
+            client_tick: 0,
+        }
+    }
+}
+
+/// Explicit authorization error types for Solar mutations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SolarAuthError {
+    RegionDenied { region_name: String, reason: String },
+    BlockBehaviorForbidden { block_state: i32, reason: String },
+    Unauthenticated { reason: String },
+    InvalidCoordinates { x: i32, y: i32, z: i32, reason: String },
+    RevisionConflict { expected: u64, actual: u64 },
+}
+
+/// RegionManager authorization hook interface.
+pub trait RegionManagerAuthorizer {
+    fn authorize_edit(
+        &self,
+        world_key: u64,
+        world_name: &str,
+        world_x: i32,
+        world_y: i32,
+        world_z: i32,
+        actor: &str,
+        auth: &SolarAuthContext,
+    ) -> Result<(), SolarAuthError>;
+}
+
+/// BlockBehavior authorization hook interface.
+pub trait BlockBehaviorAuthorizer {
+    fn authorize_state_change(
+        &self,
+        world_key: u64,
+        world_x: i32,
+        world_y: i32,
+        world_z: i32,
+        new_state: i32,
+        actor: &str,
+        auth: &SolarAuthContext,
+    ) -> Result<(), SolarAuthError>;
+}
+
+// ---------------------------------------------------------------------------
+// SpacetimeDB Table Definitions
+// ---------------------------------------------------------------------------
+
+/// Per-world metadata keyed by stable `u64 world_key`.
 #[derive(Clone)]
 #[table(
-    accessor = solar_chunk,
+    accessor = solar_world,
     public,
-    index(accessor = solar_chunk_loc, btree(columns = [world_id, chunk_x, chunk_z])),
+    index(accessor = solar_world_by_name, btree(columns = [world_name])),
 )]
-pub struct SolarChunk {
+pub struct SolarWorld {
+    /// Stable numeric world identifier. Single-column primary key.
     #[primary_key]
-    #[auto_inc]
-    pub id: u64,
-    pub world_id: String,
-    pub chunk_x: i32,
-    pub chunk_z: i32,
-    /// Solar per-chunk byte format (sections' block + biome palettes). Opaque here.
-    pub data: Vec<u8>,
-    /// Monotonic revision, bumped on each `solar_chunk_put`.
-    pub rev: u64,
+    pub world_key: u64,
+    /// Human-readable world name / routing identifier (e.g. "lobby", "island_42").
+    pub world_name: String,
+    /// World category: "lobby" | "practice_template" | "island" | "dungeon".
+    pub kind: String,
+    /// Team or player owner UUID; empty for shared/public worlds.
+    pub owner: String,
+    /// Minimum Y coordinate in world (e.g. -64).
+    pub min_y: i32,
+    /// Total world height in blocks (e.g. 384).
+    pub height: i32,
+    /// Spawn position X.
+    pub spawn_x: f64,
+    /// Spawn position Y.
+    pub spawn_y: f64,
+    /// Spawn position Z.
+    pub spawn_z: f64,
+    /// Spawn yaw angle in degrees.
+    pub spawn_yaw: f32,
+    /// Spawn pitch angle in degrees.
+    pub spawn_pitch: f32,
+    /// World generation seed.
+    pub seed: i64,
+    /// Source template name or ID (empty if authored/imported directly).
+    pub source_template: String,
+    /// World creation timestamp.
+    pub created_at: Timestamp,
+    /// Last metadata update timestamp.
     pub updated_at: Timestamp,
 }
 
-/// Append-only block-edit delta log. Each row is a single block change; peers
-/// subscribed to the world apply it live, then it is folded into `solar_chunk`
-/// and pruned (`solar_block_prune`). `chunk_x/chunk_z` are derived from `x/z`
-/// (>>4) so deltas are indexed per chunk for compaction.
+/// Canonical baseline chunk snapshot keyed by `u128 chunk_key`.
 #[derive(Clone)]
 #[table(
-    accessor = solar_block_set,
+    accessor = solar_chunk_base,
     public,
-    index(accessor = solar_block_loc, btree(columns = [world_id, chunk_x, chunk_z])),
+    index(accessor = solar_chunk_base_world, btree(columns = [world_key])),
 )]
-pub struct SolarBlockSet {
+pub struct SolarChunkBase {
+    /// Packed chunk identifier: `(world_key << 64) | ((chunk_x as u32) << 32) | (chunk_z as u32)`.
+    #[primary_key]
+    pub chunk_key: u128,
+    /// Denormalized world key for indexed world queries.
+    pub world_key: u64,
+    /// Chunk column X coordinate.
+    pub chunk_x: i32,
+    /// Chunk column Z coordinate.
+    pub chunk_z: i32,
+    /// Solar per-chunk serialized byte format (palette-compressed sections). Opaque to SpacetimeDB.
+    pub data: Vec<u8>,
+    /// Revision number represented by this base snapshot.
+    pub base_revision: u64,
+    /// Creation timestamp.
+    pub created_at: Timestamp,
+    /// Last compaction / update timestamp.
+    pub updated_at: Timestamp,
+}
+
+/// Live head revision and metadata for a chunk column keyed by `u128 chunk_key`.
+#[derive(Clone)]
+#[table(
+    accessor = solar_chunk_head,
+    public,
+    index(accessor = solar_chunk_head_world, btree(columns = [world_key])),
+)]
+pub struct SolarChunkHead {
+    /// Packed chunk identifier: `(world_key << 64) | ((chunk_x as u32) << 32) | (chunk_z as u32)`.
+    #[primary_key]
+    pub chunk_key: u128,
+    /// Denormalized world key for indexed world queries.
+    pub world_key: u64,
+    /// Chunk column X coordinate.
+    pub chunk_x: i32,
+    /// Chunk column Z coordinate.
+    pub chunk_z: i32,
+    /// Current head revision, monotonically advanced with each committed patch.
+    pub applied_revision: u64,
+    /// Base snapshot revision this head is currently built upon.
+    pub base_revision: u64,
+    /// Number of active patches accumulated on top of base_revision.
+    pub patch_count: u32,
+    /// Last head advancement timestamp.
+    pub updated_at: Timestamp,
+    /// Identity of last actor to commit a patch.
+    pub last_actor: String,
+}
+
+/// Bounded per-chunk edit batch.
+#[derive(Clone)]
+#[table(
+    accessor = solar_chunk_patch,
+    public,
+    index(accessor = solar_chunk_patch_chunk, btree(columns = [chunk_key, revision])),
+    index(accessor = solar_chunk_patch_world, btree(columns = [world_key])),
+)]
+pub struct SolarChunkPatch {
+    /// Auto-incrementing patch log ID.
     #[primary_key]
     #[auto_inc]
     pub id: u64,
-    pub world_id: String,
+    /// Packed chunk identifier: `(world_key << 64) | ((chunk_x as u32) << 32) | (chunk_z as u32)`.
+    pub chunk_key: u128,
+    /// Denormalized world key for indexed world queries.
+    pub world_key: u64,
+    /// Chunk column X coordinate.
     pub chunk_x: i32,
+    /// Chunk column Z coordinate.
     pub chunk_z: i32,
-    pub x: i32,
-    pub y: i32,
-    pub z: i32,
-    /// Minestom block state id of the new block at (x,y,z).
-    pub state: i32,
-    /// Who made the edit (player uuid / system), for audit + the future anticheat.
+    /// Monotonic revision established by this patch.
+    pub revision: u64,
+    /// Bounded edit list (max `MAX_EDITS_PER_PATCH` items).
+    pub edits: Vec<SolarBlockEdit>,
+    /// Actor UUID or system name.
     pub actor: String,
-    pub at: Timestamp,
+    /// Timestamp when this patch was applied.
+    pub created_at: Timestamp,
 }
 
-/// Per-world metadata: kind (lobby/practice_template/island), owner (team for
-/// islands), height bounds, spawn, seed, and the template it was seeded from.
+/// Compaction request for chunks with accumulated patches.
 #[derive(Clone)]
-#[table(accessor = solar_world, public)]
-pub struct SolarWorld {
+#[table(
+    accessor = solar_compaction_request,
+    public,
+    index(accessor = solar_compaction_world, btree(columns = [world_key])),
+    index(accessor = solar_compaction_status, btree(columns = [status])),
+)]
+pub struct SolarCompactionRequest {
+    /// Packed chunk identifier: `(world_key << 64) | ((chunk_x as u32) << 32) | (chunk_z as u32)`.
     #[primary_key]
-    pub world_id: String,
-    /// "lobby" | "practice_template" | "island" | …
-    pub kind: String,
-    /// Team / owner id for per-team worlds; empty for shared worlds.
-    pub owner: String,
-    pub min_y: i32,
-    pub height: i32,
-    pub spawn_x: f64,
-    pub spawn_y: f64,
-    pub spawn_z: f64,
-    pub spawn_yaw: f32,
-    pub spawn_pitch: f32,
-    pub seed: i64,
-    /// world_id this was seeded from (empty if authored/imported directly).
-    pub source_template: String,
-    pub created_at: Timestamp,
+    pub chunk_key: u128,
+    /// Denormalized world key for indexed world queries.
+    pub world_key: u64,
+    /// Chunk column X coordinate.
+    pub chunk_x: i32,
+    /// Chunk column Z coordinate.
+    pub chunk_z: i32,
+    /// Target revision to compact up to.
+    pub head_revision: u64,
+    /// Number of patches pending compaction.
+    pub patch_count: u32,
+    /// Request status: "pending" | "in_progress" | "failed".
+    pub status: String,
+    /// Timestamp when compaction was requested.
+    pub requested_at: Timestamp,
+    /// Originating requester ("system_auto_threshold" | admin UUID).
+    pub requested_by: String,
+}
+
+// ---------------------------------------------------------------------------
+// Validation & State Transition Helpers
+// ---------------------------------------------------------------------------
+
+/// Validates a batch of block edits against bounded limits and height constraints.
+pub fn validate_patch_bounds(
+    edits: &[SolarBlockEdit],
+    world_min_y: i32,
+    world_height: i32,
+) -> Result<(), String> {
+    if edits.is_empty() {
+        return Err("patch contains no edits (empty batch)".to_string());
+    }
+    if edits.len() > MAX_EDITS_PER_PATCH {
+        return Err(format!(
+            "patch exceeds maximum batch limit of {} (got {})",
+            MAX_EDITS_PER_PATCH,
+            edits.len()
+        ));
+    }
+    let max_y = world_min_y + world_height;
+    for (i, edit) in edits.iter().enumerate() {
+        if !edit.is_valid_local() {
+            return Err(format!(
+                "edit [{}] local coords ({}, {}) out of chunk range 0..=15",
+                i, edit.x, edit.z
+            ));
+        }
+        let y = edit.y as i32;
+        if y < world_min_y || y >= max_y {
+            return Err(format!(
+                "edit [{}] y={} out of world height bounds [{}, {})",
+                i, y, world_min_y, max_y
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Evaluates expected revision against current head revision for atomic commits.
+pub fn check_expected_revision(
+    current_head_revision: Option<u64>,
+    expected_revision: u64,
+) -> Result<u64, String> {
+    match current_head_revision {
+        Some(actual) => {
+            if actual != expected_revision {
+                Err(format!(
+                    "revision conflict: expected revision {}, current head is {}",
+                    expected_revision, actual
+                ))
+            } else {
+                Ok(actual + 1)
+            }
+        }
+        None => {
+            if expected_revision != 0 {
+                Err(format!(
+                    "revision conflict: chunk head does not exist, expected revision 0 (got {})",
+                    expected_revision
+                ))
+            } else {
+                Ok(1)
+            }
+        }
+    }
+}
+
+/// Validates revision boundaries during compaction completion.
+pub fn validate_compaction_bounds(
+    base_revision: u64,
+    applied_revision: u64,
+    compacted_up_to_revision: u64,
+) -> Result<(), String> {
+    if compacted_up_to_revision <= base_revision {
+        return Err(format!(
+            "compacted_up_to_revision ({}) must be greater than current base_revision ({})",
+            compacted_up_to_revision, base_revision
+        ));
+    }
+    if compacted_up_to_revision > applied_revision {
+        return Err(format!(
+            "compacted_up_to_revision ({}) cannot exceed current head revision ({})",
+            compacted_up_to_revision, applied_revision
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Native Test Stubs for SpacetimeDB Host Imports
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod host_stubs {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn bytes_sink_write(_: *const u8, _: usize) {}
+    #[unsafe(no_mangle)]
+    pub extern "C" fn bytes_source_remaining_length() -> usize { 0 }
+    #[unsafe(no_mangle)]
+    pub extern "C" fn bytes_source_read(_: *mut u8, _: usize) -> usize { 0 }
+    #[unsafe(no_mangle)]
+    pub extern "C" fn procedure_sleep_until(_: u64) {}
+    #[unsafe(no_mangle)]
+    pub extern "C" fn console_timer_start(_: *const u8, _: usize) -> u32 { 0 }
+    #[unsafe(no_mangle)]
+    pub extern "C" fn console_log(_: u32, _: *const u8, _: usize) {}
+    #[unsafe(no_mangle)]
+    pub extern "C" fn table_id_from_name(_: *const u8, _: usize) -> u32 { 0 }
+    #[unsafe(no_mangle)]
+    pub extern "C" fn get_jwt(_: *mut u8, _: usize) -> usize { 0 }
+    #[unsafe(no_mangle)]
+    pub extern "C" fn identity(_: *mut u8) {}
+    #[unsafe(no_mangle)]
+    pub extern "C" fn console_timer_end(_: u32) {}
+    #[unsafe(no_mangle)]
+    pub extern "C" fn datastore_table_scan_bsatn(_: u32) -> u32 { 0 }
+    #[unsafe(no_mangle)]
+    pub extern "C" fn datastore_index_scan_point_bsatn(_: u32, _: *const u8, _: usize) -> u32 { 0 }
+    #[unsafe(no_mangle)]
+    pub extern "C" fn datastore_index_scan_range_bsatn(_: u32, _: *const u8, _: usize, _: *const u8, _: usize) -> u32 { 0 }
+    #[unsafe(no_mangle)]
+    pub extern "C" fn datastore_delete_by_index_scan_point_bsatn(_: u32, _: *const u8, _: usize) -> u32 { 0 }
+    #[unsafe(no_mangle)]
+    pub extern "C" fn datastore_delete_by_index_scan_range_bsatn(_: u32, _: *const u8, _: usize, _: *const u8, _: usize) -> u32 { 0 }
+    #[unsafe(no_mangle)]
+    pub extern "C" fn row_iter_bsatn_advance(_: u32) -> u32 { 0 }
+    #[unsafe(no_mangle)]
+    pub extern "C" fn row_iter_bsatn_close(_: u32) {}
+}
+
+// ---------------------------------------------------------------------------
+// Unit Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pack_unpack_chunk_key_roundtrip() {
+        let test_cases = [
+            (0u64, 0i32, 0i32),
+            (1u64, 100i32, 200i32),
+            (42u64, -1i32, -1i32),
+            (999u64, -1500i32, 3200i32),
+            (0x1234_5678_9ABC_DEF0u64, i32::MIN, i32::MAX),
+            (u64::MAX, i32::MAX, i32::MIN),
+            (7u64, -16i32, 16i32),
+            (100u64, -128i32, -256i32),
+        ];
+
+        for (world_key, chunk_x, chunk_z) in test_cases {
+            let packed = pack_chunk_key(world_key, chunk_x, chunk_z);
+            let (unpacked_world, unpacked_x, unpacked_z) = unpack_chunk_key(packed);
+            assert_eq!(unpacked_world, world_key, "world_key mismatch for ({world_key}, {chunk_x}, {chunk_z})");
+            assert_eq!(unpacked_x, chunk_x, "chunk_x mismatch for ({world_key}, {chunk_x}, {chunk_z})");
+            assert_eq!(unpacked_z, chunk_z, "chunk_z mismatch for ({world_key}, {chunk_x}, {chunk_z})");
+        }
+    }
+
+    #[test]
+    fn test_key_packing_bit_layout_formula() {
+        let world_key: u64 = 0x0123_4567_89AB_CDEF;
+        let chunk_x: i32 = 0x1234_5678;
+        let chunk_z: i32 = -1; // 0xFFFF_FFFF in u32
+
+        let packed = pack_chunk_key(world_key, chunk_x, chunk_z);
+
+        // Verify exact bit positions:
+        // World: bits [64..127]
+        let high_64 = (packed >> 64) as u64;
+        assert_eq!(high_64, world_key);
+
+        // Chunk X: bits [32..63]
+        let mid_32 = ((packed >> 32) & 0xFFFF_FFFF) as u32 as i32;
+        assert_eq!(mid_32, chunk_x);
+
+        // Chunk Z: bits [0..31]
+        let low_32 = (packed & 0xFFFF_FFFF) as u32 as i32;
+        assert_eq!(low_32, chunk_z);
+    }
+
+    #[test]
+    fn test_bounded_patch_validation_empty() {
+        let edits: Vec<SolarBlockEdit> = vec![];
+        let result = validate_patch_bounds(&edits, -64, 384);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty batch"));
+    }
+
+    #[test]
+    fn test_bounded_patch_validation_max_size() {
+        // Valid limit (256 edits)
+        let valid_edits: Vec<SolarBlockEdit> = (0..256)
+            .map(|i| SolarBlockEdit::new((i % 16) as u8, 64, ((i / 16) % 16) as u8, 1))
+            .collect();
+        assert!(validate_patch_bounds(&valid_edits, -64, 384).is_ok());
+
+        // Exceeding limit (257 edits)
+        let mut oversized_edits = valid_edits;
+        oversized_edits.push(SolarBlockEdit::new(0, 64, 0, 1));
+        let result = validate_patch_bounds(&oversized_edits, -64, 384);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("exceeds maximum batch limit"));
+    }
+
+    #[test]
+    fn test_bounded_patch_validation_coordinate_bounds() {
+        // Local X out of range
+        let invalid_x = vec![SolarBlockEdit::new(16, 64, 5, 1)];
+        assert!(validate_patch_bounds(&invalid_x, -64, 384).is_err());
+
+        // Local Z out of range
+        let invalid_z = vec![SolarBlockEdit::new(5, 64, 16, 1)];
+        assert!(validate_patch_bounds(&invalid_z, -64, 384).is_err());
+
+        // Y below min_y (-64)
+        let invalid_y_low = vec![SolarBlockEdit::new(5, -65, 5, 1)];
+        assert!(validate_patch_bounds(&invalid_y_low, -64, 384).is_err());
+
+        // Y above max_y (-64 + 384 = 320)
+        let invalid_y_high = vec![SolarBlockEdit::new(5, 320, 5, 1)];
+        assert!(validate_patch_bounds(&invalid_y_high, -64, 384).is_err());
+
+        // Valid boundary Y values
+        let valid_bounds = vec![
+            SolarBlockEdit::new(0, -64, 0, 1),
+            SolarBlockEdit::new(15, 319, 15, 1),
+        ];
+        assert!(validate_patch_bounds(&valid_bounds, -64, 384).is_ok());
+    }
+
+    #[test]
+    fn test_world_to_local_coordinate_conversions() {
+        // Negative chunk coords (-1, -1) -> world bounds [-16..-1, -16..-1]
+        let world_x = -5; // inside chunk_x = -1, local x = 11
+        let world_z = -12; // inside chunk_z = -1, local z = 4
+        let edit = SolarBlockEdit::from_world_coords(world_x, 70, world_z, 42);
+
+        assert_eq!(edit.x, 11);
+        assert_eq!(edit.y, 70);
+        assert_eq!(edit.z, 4);
+        assert_eq!(edit.state, 42);
+        assert!(edit.is_valid_local());
+
+        let (wx, wy, wz) = edit.to_world_coords(-1, -1);
+        assert_eq!(wx, world_x);
+        assert_eq!(wy, 70);
+        assert_eq!(wz, world_z);
+    }
+
+    #[test]
+    fn test_atomic_revision_conflict_rejection() {
+        // Expected revision matches existing head -> succeeds and increments
+        let next_rev = check_expected_revision(Some(5), 5);
+        assert_eq!(next_rev, Ok(6));
+
+        // Expected revision mismatch -> rejects atomically
+        let conflict = check_expected_revision(Some(5), 4);
+        assert!(conflict.is_err());
+        assert!(conflict.unwrap_err().contains("revision conflict"));
+
+        // Chunk has no head yet, expecting revision 0 -> succeeds
+        let initial_rev = check_expected_revision(None, 0);
+        assert_eq!(initial_rev, Ok(1));
+
+        // Chunk has no head yet, expecting non-zero -> rejects
+        let invalid_initial = check_expected_revision(None, 1);
+        assert!(invalid_initial.is_err());
+        assert!(invalid_initial.unwrap_err().contains("chunk head does not exist"));
+    }
+
+    #[test]
+    fn test_compaction_bounds_validation() {
+        // Valid compaction: base=10, head=25, compact_to=20
+        assert!(validate_compaction_bounds(10, 25, 20).is_ok());
+
+        // Valid full compaction: base=10, head=25, compact_to=25
+        assert!(validate_compaction_bounds(10, 25, 25).is_ok());
+
+        // Invalid: compact_to <= base (no progress)
+        let no_progress = validate_compaction_bounds(10, 25, 10);
+        assert!(no_progress.is_err());
+
+        // Invalid: compact_to > head (compacting unapplied future revision)
+        let future_compact = validate_compaction_bounds(10, 25, 26);
+        assert!(future_compact.is_err());
+    }
+
+    struct MockRegionManager {
+        safezones: Vec<(i32, i32, i32, i32, i32, i32)>,
+    }
+
+    impl RegionManagerAuthorizer for MockRegionManager {
+        fn authorize_edit(
+            &self,
+            _world_key: u64,
+            _world_name: &str,
+            world_x: i32,
+            world_y: i32,
+            world_z: i32,
+            _actor: &str,
+            auth: &SolarAuthContext,
+        ) -> Result<(), SolarAuthError> {
+            if auth.is_admin || auth.bypass_claims {
+                return Ok(());
+            }
+            for (min_x, min_y, min_z, max_x, max_y, max_z) in &self.safezones {
+                if world_x >= *min_x
+                    && world_x <= *max_x
+                    && world_y >= *min_y
+                    && world_y <= *max_y
+                    && world_z >= *min_z
+                    && world_z <= *max_z
+                {
+                    return Err(SolarAuthError::RegionDenied {
+                        region_name: "SpawnSafezone".to_string(),
+                        reason: "edits forbidden in safezone".to_string(),
+                    });
+                }
+            }
+            Ok(())
+        }
+    }
+
+    struct MockBlockBehavior;
+
+    impl BlockBehaviorAuthorizer for MockBlockBehavior {
+        fn authorize_state_change(
+            &self,
+            _world_key: u64,
+            _world_x: i32,
+            _world_y: i32,
+            _world_z: i32,
+            new_state: i32,
+            _actor: &str,
+            auth: &SolarAuthContext,
+        ) -> Result<(), SolarAuthError> {
+            if auth.is_admin {
+                return Ok(());
+            }
+            if new_state < 0 {
+                return Err(SolarAuthError::BlockBehaviorForbidden {
+                    block_state: new_state,
+                    reason: "negative state id forbidden".to_string(),
+                });
+            }
+            if new_state == 9999 {
+                return Err(SolarAuthError::BlockBehaviorForbidden {
+                    block_state: new_state,
+                    reason: "blacklisted bedrock replacement".to_string(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_authorization_hooks_evaluation() {
+        let region_mgr = MockRegionManager {
+            safezones: vec![(0, -64, 0, 100, 320, 100)],
+        };
+        let block_behavior = MockBlockBehavior;
+
+        // Player editing inside safezone -> Denied
+        let player_auth = SolarAuthContext {
+            actor: "player_1".to_string(),
+            is_admin: false,
+            bypass_claims: false,
+            client_tick: 100,
+        };
+        let res = region_mgr.authorize_edit(1, "world", 50, 64, 50, "player_1", &player_auth);
+        assert!(matches!(res, Err(SolarAuthError::RegionDenied { .. })));
+
+        // Admin editing inside safezone -> Allowed
+        let admin_auth = SolarAuthContext {
+            actor: "admin_1".to_string(),
+            is_admin: true,
+            bypass_claims: true,
+            client_tick: 101,
+        };
+        assert!(region_mgr
+            .authorize_edit(1, "world", 50, 64, 50, "admin_1", &admin_auth)
+            .is_ok());
+
+        // Player editing outside safezone -> Allowed
+        assert!(region_mgr
+            .authorize_edit(1, "world", 500, 64, 500, "player_1", &player_auth)
+            .is_ok());
+
+        // Player attempting forbidden block state -> Denied
+        let forbidden_state =
+            block_behavior.authorize_state_change(1, 500, 64, 500, 9999, "player_1", &player_auth);
+        assert!(matches!(
+            forbidden_state,
+            Err(SolarAuthError::BlockBehaviorForbidden { .. })
+        ));
+
+        // Player placing valid state -> Allowed
+        assert!(block_behavior
+            .authorize_state_change(1, 500, 64, 500, 1, "player_1", &player_auth)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_chunk_lifecycle_state_machine() {
+        // Step 1: Initial commit on brand new chunk (expected_rev = 0)
+        let mut current_head: Option<SolarChunkHead> = None;
+        let mut patch_count = 0;
+
+        let world_key = 100u64;
+        let chunk_x = 5;
+        let chunk_z = -3;
+        let chunk_key = pack_chunk_key(world_key, chunk_x, chunk_z);
+
+        // Attempt commit with wrong expected revision (expected = 5 on new chunk) -> Atomic Rejection
+        let conflict = check_expected_revision(
+            current_head.as_ref().map(|h| h.applied_revision),
+            5,
+        );
+        assert!(conflict.is_err());
+        assert_eq!(
+            current_head.as_ref().map(|h| h.applied_revision),
+            None,
+            "State must remain unchanged on rejection"
+        );
+
+        // Successful commit at expected = 0 -> Advances to rev 1
+        let next_rev = check_expected_revision(
+            current_head.as_ref().map(|h| h.applied_revision),
+            0,
+        )
+        .unwrap();
+        assert_eq!(next_rev, 1);
+        patch_count += 1;
+        current_head = Some(SolarChunkHead {
+            chunk_key,
+            world_key,
+            chunk_x,
+            chunk_z,
+            applied_revision: next_rev,
+            base_revision: 0,
+            patch_count,
+            updated_at: Timestamp::from_micros_since_unix_epoch(1000),
+            last_actor: "player_1".to_string(),
+        });
+
+        // Step 2: Second edit expecting rev 1 -> Advances to rev 2
+        let next_rev = check_expected_revision(
+            current_head.as_ref().map(|h| h.applied_revision),
+            1,
+        )
+        .unwrap();
+        assert_eq!(next_rev, 2);
+        patch_count += 1;
+        {
+            let head = current_head.as_mut().unwrap();
+            head.applied_revision = next_rev;
+            head.patch_count = patch_count;
+        }
+
+        // Step 3: Concurrent edit sending stale expected rev 1 when current head is 2 -> Atomic Rejection
+        let stale_rejection = check_expected_revision(
+            current_head.as_ref().map(|h| h.applied_revision),
+            1,
+        );
+        assert!(stale_rejection.is_err());
+        assert_eq!(current_head.as_ref().unwrap().applied_revision, 2);
+
+        // Step 4: Compaction threshold verification
+        let head = current_head.as_mut().unwrap();
+        head.patch_count = COMPACTION_THRESHOLD_PATCHES;
+        let needs_compaction = head.patch_count >= COMPACTION_THRESHOLD_PATCHES;
+        assert!(needs_compaction);
+
+        // Compaction succeeds up to revision 2
+        assert!(validate_compaction_bounds(head.base_revision, head.applied_revision, 2).is_ok());
+        head.base_revision = 2;
+        head.patch_count = 0;
+        assert_eq!(head.base_revision, 2);
+        assert_eq!(head.patch_count, 0);
+    }
 }

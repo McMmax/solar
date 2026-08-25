@@ -1,21 +1,21 @@
 # ☀️ Solar
 
-**Solar** is a highly optimized spatial data and geometry formatting library, featuring implementations in both **JVM (Java/Kotlin)** and **Native (Rust)**.
+**Solar** is a highly optimized per-chunk world persistence and streaming library for SpacetimeDB and Minestom, featuring implementations in both **JVM (Java/Kotlin)** and **Native (Rust)**.
 
 ---
 
-## 🎯 What does it do?
-When dealing with massive game worlds, you often need to store, compress, and transmit complex geometric data—like 3D regions, chunk layouts, or spatial partitioning bounds. 
+## 🎯 Architecture (Solar v1)
 
-Solar provides a strictly defined data format and the tooling to read/write it. It is designed to work hand-in-hand with [Polar](../polar) to ensure that spatial data is handled as efficiently as possible before it even touches the main game loop.
+Solar v1 replaces the experimental per-block prototype with a bounded, SpacetimeDB 2.8.2-friendly data model:
 
-## 🏗️ Architecture
-
-- **`schema/` (Rust)**: The definitive source of truth for the Solar format. Defines exactly how bytes are packed and structured.
-- **`native/` (Rust)**: High-performance native parsing and manipulation of Solar data.
-- **`jvm/` (Java)**: The JVM bindings and implementations, allowing Minestom servers to seamlessly serialize and deserialize Solar formats.
+- **`schema/` (Rust)**: Canonical schema crate (`solar-schema`) defining the 5 core persistence tables, single-column packed `u128 chunk_key`, bounded patch batches (`MAX_EDITS_PER_PATCH = 256`), and authorization hook traits.
+- **`native/` (Rust)**: Native bridge (`solar-bridge`) providing fast $O(1)$ in-memory SDK cache lookups, oneway reducer dispatch, and per-world subscriptions.
+- **`jvm/` (Java)**: Minestom `SolarLoader` implementing asynchronous chunk streaming and local delta handling.
 
 ## 🚀 Key Features
-- **Ultra-Compact**: Designed to aggressively compress spatial data, saving network bandwidth and database storage.
-- **Cross-Ecosystem**: 100% parity between the Rust native implementation and the JVM implementation.
-- **Zero-Copy Architecture**: Where possible, Solar avoids duplicating memory, directly mapping byte buffers to usable objects.
+
+- **Single-Column Packed Keys**: `chunk_key = (world_key << 64) | ((chunk_x as u32) << 32) | (chunk_z as u32)` guarantees instant $O(1)$ primary key lookups without linear cache scans.
+- **Bounded Edit Batches**: Mutations are grouped into bounded `solar_chunk_patch` batches, preventing table row explosion in SpacetimeDB RAM.
+- **Atomic Revision Fencing**: Reducers enforce optimistic revision checks (`applied_revision == expected_revision`) before committing patches.
+- **Explicit Authorization Hooks**: Gated through `RegionManagerAuthorizer` and `BlockBehaviorAuthorizer` before state mutation.
+- **Amortized Compaction**: Background compactor folds delta patches into `solar_chunk_base` and prunes historical logs when threshold is reached.

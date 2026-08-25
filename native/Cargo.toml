@@ -13,6 +13,7 @@ crate-type = ["rlib"]
 # and platforms/stomzy/spacetime/{native,stdb}) — a mismatched client silently
 # drops live TransactionUpdates. See the project's spacetimedb-version-lock note.
 spacetimedb-sdk = "=2.8.2"
+solar-schema = { path = "../schema" }
 
 # The generated Rust client for spacetime/coldmain (table/reducer bindings). Same crate
 # platforms/stomzy/spacetime/native depends on — solar-bridge reads/writes through it, it
