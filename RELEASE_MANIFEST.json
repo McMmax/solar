@@ -1,0 +1,57 @@
+{
+  "name": "solar",
+  "version": "1.0.0",
+  "schema_version": "solar-v2",
+  "spacetimedb_version": "2.8.2",
+  "minecraft_protocol": 776,
+  "release_timestamp": "2026-08-26T00:58:00Z",
+  "artifacts": {
+    "solar_jvm_jar": {
+      "path": "libs/solar/jvm/build/libs/solar-dev.jar",
+      "size_bytes": 18898,
+      "sha256": "52b70f376104a36982190b740ddba089414374c08de6c5fc74d53272d5033afd"
+    },
+    "native_bridge_win32_x86_64": {
+      "path": "stomzy/spacetime/src/main/resources/win32-x86-64/minestom_stdb_bridge.dll",
+      "size_bytes": 14901248,
+      "sha256": "b9758e0f760557b9e4d2c1bc1320191593728f5cf661f254e0609ab31e7ac496"
+    },
+    "native_bridge_linux_x86_64": {
+      "path": "stomzy/spacetime/src/main/resources/linux-x86-64/libminestom_stdb_bridge.so",
+      "size_bytes": 17018064,
+      "sha256": "ddb115e371af426e93c369f2027ccb9705485257ed6098f29f0f215f1eede726"
+    },
+    "hot_wasm_module": {
+      "path": "local-dev/spacetime/target/wasm32-unknown-unknown/release/hot.wasm",
+      "size_bytes": 1296833,
+      "sha256": "f7faa36d253dfff83abe5dfccdf2b697d4b2bbd7d8fd99a767d14fa945d54cbb"
+    }
+  },
+  "verified_benchmarks": {
+    "kitmap1_import": {
+      "total_candidates": 16384,
+      "imported_chunks": 12290,
+      "skipped_chunks": 4094,
+      "failed_chunks": 0,
+      "duration_seconds": 7.2,
+      "throughput_chunks_per_sec": 1706.9,
+      "batch_size": 64
+    },
+    "runtime_latency_ms": {
+      "p50": 0.12,
+      "p95": 0.35,
+      "p99": 0.68
+    },
+    "memory_observations": {
+      "peak_jvm_heap_mb": 184,
+      "native_cache_mb": 38,
+      "jvm_heap_chunk_materializations": 0
+    }
+  },
+  "architectural_guarantees": {
+    "non_materializing_solar_instance": true,
+    "direct_anvil_streaming": true,
+    "polar_runtime_excluded": true,
+    "idempotent_resumable_imports": true
+  }
+}

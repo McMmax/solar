@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class SolarChunkCodecTest {
@@ -60,5 +61,26 @@ class SolarChunkCodecTest {
 
         final SolarChunkCodec.Decoded decoded = SolarChunkCodec.decode(encoded);
         assertEquals(Block.AIR.stateId(), decoded.sections().get(0).blockPalette().singleValue());
+    }
+
+    @Test
+    void rejectsMalformedChunkPayloads() {
+        MinecraftServer.init();
+
+        // Null or truncated
+        assertThrows(dev.terrorify.solar.exception.MalformedChunkException.class,
+                () -> SolarChunkCodec.decode(null));
+        assertThrows(dev.terrorify.solar.exception.MalformedChunkException.class,
+                () -> SolarChunkCodec.decode(new byte[]{1, 2, 3}));
+
+        // Bad magic
+        byte[] badMagic = new byte[]{0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};
+        assertThrows(dev.terrorify.solar.exception.MalformedChunkException.class,
+                () -> SolarChunkCodec.decode(badMagic));
+
+        // Bad version
+        byte[] badVersion = new byte[]{0x53, 0x6F, 0x6C, 0x72, (byte) 0x99, 0x00, 0x00, 0x00, 0x00};
+        assertThrows(dev.terrorify.solar.exception.MalformedChunkException.class,
+                () -> SolarChunkCodec.decode(badVersion));
     }
 }

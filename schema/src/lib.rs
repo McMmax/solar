@@ -456,6 +456,7 @@ pub fn validate_world_lifecycle_transition(
         (Some(WORLD_STATUS_ACTIVE), WORLD_STATUS_FALLBACK) => Ok(()),
         (Some(WORLD_STATUS_FALLBACK), WORLD_STATUS_ACTIVE) => Ok(()),
         (Some(WORLD_STATUS_FAILED), WORLD_STATUS_IMPORTING) => Ok(()),
+        (Some(WORLD_STATUS_ACTIVE), WORLD_STATUS_IMPORTING) => Ok(()),
         (Some(c), t) if c == t => Ok(()), // idempotent re-assertion
         (Some(c), t) => Err(format!(
             "invalid world lifecycle transition from '{c}' to '{t}'"

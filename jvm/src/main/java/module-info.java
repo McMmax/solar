@@ -10,4 +10,5 @@ module dev.terrorify.solar {
     requires java.base;
 
     exports dev.terrorify.solar;
+    exports dev.terrorify.solar.exception;
 }

@@ -15,27 +15,36 @@ import org.jetbrains.annotations.Nullable;
  * wait for reducer acknowledgement.
  */
 public interface SolarStore {
-    /** Cache read for one chunk column's Solar bytes, or {@code null} if not resident yet. */
-    byte @Nullable [] getChunk(@NotNull String worldId, int chunkX, int chunkZ);
+    /** Cache read for one chunk column's Solar bytes. Retired in favor of active Hot v2 native frame cache. */
+    @Deprecated
+    default byte @Nullable [] getChunk(@NotNull String worldId, int chunkX, int chunkZ) {
+        throw new UnsupportedOperationException("Materializing getChunk is retired — use Hot v2 native frame cache");
+    }
 
-    /** Upsert the canonical state of one chunk column ({@code solar_chunk_put}, oneway). */
-    void putChunk(@NotNull String worldId, int chunkX, int chunkZ, byte @NotNull [] data);
+    /** Upsert one chunk column ({@code solar_chunk_put}, oneway). Retired in favor of {@code solar_chunk_base_commit}. */
+    @Deprecated
+    default void putChunk(@NotNull String worldId, int chunkX, int chunkZ, byte @NotNull [] data) {
+        throw new UnsupportedOperationException("solar_chunk_put is retired — use solar_chunk_base_commit");
+    }
 
-    /** Append one live block-edit delta ({@code solar_block_set_apply}, oneway). */
-    void applyBlockSet(@NotNull String worldId, int x, int y, int z, int state, @NotNull String actor);
+    /** Append block edit ({@code solar_block_set_apply}, oneway). Retired in favor of {@code solar_commit_edits}. */
+    @Deprecated
+    default void applyBlockSet(@NotNull String worldId, int x, int y, int z, int state, @NotNull String actor) {
+        throw new UnsupportedOperationException("solar_block_set_apply is retired — use solar_commit_edits");
+    }
 
-    /** Drop deltas already folded into {@code solar_chunk} ({@code solar_block_prune}, oneway). */
-    void prune(@NotNull String worldId, int chunkX, int chunkZ, long upToId);
+    /** Drop deltas ({@code solar_block_prune}, oneway). Retired in favor of compaction leasing. */
+    @Deprecated
+    default void prune(@NotNull String worldId, int chunkX, int chunkZ, long upToId) {
+        throw new UnsupportedOperationException("solar_block_prune is retired — use compaction leasing");
+    }
 
-    /** Create or update a world's metadata row ({@code solar_world_upsert}, oneway). */
-    void putWorld(@NotNull SolarWorld world);
+    /** Create/update world metadata ({@code solar_world_upsert}, oneway). Retired in favor of {@code solar_world_create_or_import}. */
+    @Deprecated
+    default void putWorld(@NotNull SolarWorld world) {
+        throw new UnsupportedOperationException("solar_world_upsert is retired — use solar_world_create_or_import");
+    }
 
-    /** No-op implementation for loaders that don't need Solar persistence (e.g. tests). */
-    SolarStore NO_OP = new SolarStore() {
-        @Override public byte @Nullable [] getChunk(@NotNull String worldId, int chunkX, int chunkZ) { return null; }
-        @Override public void putChunk(@NotNull String worldId, int chunkX, int chunkZ, byte @NotNull [] data) {}
-        @Override public void applyBlockSet(@NotNull String worldId, int x, int y, int z, int state, @NotNull String actor) {}
-        @Override public void prune(@NotNull String worldId, int chunkX, int chunkZ, long upToId) {}
-        @Override public void putWorld(@NotNull SolarWorld world) {}
-    };
+    /** Default NO_OP implementation for loaders that don't require Solar persistence (e.g. tests). */
+    SolarStore NO_OP = new SolarStore() {};
 }

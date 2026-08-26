@@ -146,7 +146,7 @@ pub fn reconstruct_chunk_frame(
     let (world_key, chunk_x, chunk_z) = unpack_chunk_key(chunk_key);
 
     match (base, head) {
-        (None, None) => Err(SolarReadError::NotFound { chunk_key }),
+        (None, _) => Err(SolarReadError::NotFound { chunk_key }),
         (Some(b), None) => {
             if b.data.is_empty() {
                 return Err(SolarReadError::EmptyBaseData { chunk_key });
@@ -162,16 +162,11 @@ pub fn reconstruct_chunk_frame(
                 ordered_patches: Vec::new(),
             })
         }
-        (base_opt, Some(h)) => {
-            let base_data = match base_opt {
-                Some(b) => {
-                    if b.data.is_empty() {
-                        return Err(SolarReadError::EmptyBaseData { chunk_key });
-                    }
-                    b.data.clone()
-                }
-                None => Vec::new(),
-            };
+        (Some(b), Some(h)) => {
+            if b.data.is_empty() {
+                return Err(SolarReadError::EmptyBaseData { chunk_key });
+            }
+            let base_data = b.data.clone();
 
             if h.applied_revision < h.base_revision {
                 return Err(SolarReadError::InvalidRevisionSequence {
