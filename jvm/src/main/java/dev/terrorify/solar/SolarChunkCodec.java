@@ -14,6 +14,7 @@ import java.util.List;
 
 import static net.minestom.server.network.NetworkBuffer.BYTE;
 import static net.minestom.server.network.NetworkBuffer.INT;
+import static net.minestom.server.network.NetworkBuffer.LONG;
 import static net.minestom.server.network.NetworkBuffer.SHORT;
 
 /**
@@ -24,25 +25,46 @@ import static net.minestom.server.network.NetworkBuffer.SHORT;
  *
  * <h2>Container Format</h2>
  * <pre>{@code
- * magic(u32: 'Solr') | version(u8: 1) | flags(u8) | min_section(i16) | section_count(u8)
+ * magic(u32: 'Solr') | version(u8: 2) | flags(u8) | min_section(i16) | section_count(u8)
  * followed by section_count sections:
  *   present(u8: 0=empty, 1=populated)
  *   [if present==1]: block_palette (Minestom NetworkBuffer) | biome_palette (if flags.has_biomes)
+ * followed by v2 light data when {@code flags.has_lights}:
+ *   section_count × (light_flags(u8) | sky_light[2048]? | block_light[2048]?)
  * }</pre>
  */
 public final class SolarChunkCodec {
     private SolarChunkCodec() {}
 
     private static final int MAGIC = 0x536F6C72; // "Solr"
-    private static final byte VERSION = 1;
+    /** V1 is accepted by {@link #decode(byte[])} for migration, but new imports are always v2. */
+    private static final byte VERSION = 2;
+    private static final byte LEGACY_VERSION = 1;
     private static final int FLAG_HAS_BIOMES = 2; // bit 1
+    // Bit 2 is reserved by the original format for block entities.
+    private static final int FLAG_HAS_LIGHTS = 8; // bit 3
+    private static final int FLAG_HAS_HEIGHTMAPS = 16; // bit 4
+    private static final int LIGHT_ARRAY_BYTES = 2048;
+    private static final int HEIGHTMAP_LONGS = 37;
 
     /** Reconstructed chunk-column contents from {@link #decode}. */
-    public record Decoded(int minSection, @NotNull List<Section> sections) {}
+    public record Decoded(int minSection, @NotNull List<Section> sections, @NotNull List<SectionLight> lights,
+                          long @NotNull [] @NotNull [] heightmaps, boolean legacyLighting) {}
+
+    /** Immutable Anvil light arrays for one section. Empty arrays mean the source omitted that layer. */
+    public record SectionLight(byte @NotNull [] skyLight, byte @NotNull [] blockLight) {
+        public SectionLight {
+            skyLight = skyLight.clone();
+            blockLight = blockLight.clone();
+        }
+    }
 
     /** Encode a loaded chunk column. Convenience overload of {@link #encode(int, List)}. */
     public static byte[] encode(@NotNull Chunk chunk) {
-        return encode(chunk.getMinSection(), chunk.getSections());
+        return encode(chunk.getMinSection(), chunk.getSections(), new long[][] {
+                chunk.motionBlockingHeightmap().getNBT(),
+                chunk.worldSurfaceHeightmap().getNBT()
+        });
     }
 
     /**
@@ -55,13 +77,19 @@ public final class SolarChunkCodec {
      * @return canonical Solar encoded byte array
      */
     public static byte[] encode(int minSection, @NotNull List<Section> sections) {
+        return encode(minSection, sections, null);
+    }
+
+    private static byte[] encode(int minSection, @NotNull List<Section> sections, long[][] heightmaps) {
         final NetworkBuffer.Type<Palette> biomeSerializer =
                 Palette.biomeSerializer(MinecraftServer.getBiomeRegistry().size());
 
         return NetworkBuffer.makeArray(buffer -> {
             buffer.write(INT, MAGIC);
             buffer.write(BYTE, VERSION);
-            buffer.write(BYTE, (byte) FLAG_HAS_BIOMES);
+            final boolean hasHeightmaps = heightmaps != null && heightmaps.length == 2
+                    && heightmaps[0].length == HEIGHTMAP_LONGS && heightmaps[1].length == HEIGHTMAP_LONGS;
+            buffer.write(BYTE, (byte) (FLAG_HAS_BIOMES | FLAG_HAS_LIGHTS | (hasHeightmaps ? FLAG_HAS_HEIGHTMAPS : 0)));
             buffer.write(SHORT, (short) minSection);
             buffer.write(BYTE, (byte) sections.size());
 
@@ -75,6 +103,14 @@ public final class SolarChunkCodec {
                 buffer.write(BYTE, (byte) 1);
                 buffer.write(Palette.BLOCK_SERIALIZER, blockPalette);
                 buffer.write(biomeSerializer, section.biomePalette());
+            }
+            // Keep source Anvil lighting verbatim. The runtime must not invent full skylight for
+            // enclosed KitMap sections: it changes the client's light/culling decisions.
+            for (Section section : sections) {
+                writeLight(buffer, section.skyLight().array(), section.blockLight().array());
+            }
+            if (hasHeightmaps) {
+                for (long[] map : heightmaps) for (long value : map) buffer.write(LONG, value);
             }
         });
     }
@@ -97,11 +133,13 @@ public final class SolarChunkCodec {
             throw new MalformedChunkException("Solar chunk blob: bad magic 0x" + Integer.toHexString(magic));
         }
         final byte version = buffer.read(BYTE);
-        if (version != VERSION) {
+        if (version != VERSION && version != LEGACY_VERSION) {
             throw new MalformedChunkException("Solar chunk blob: unsupported version " + version);
         }
         final byte flags = buffer.read(BYTE);
         final boolean hasBiomes = (flags & FLAG_HAS_BIOMES) != 0 || (flags & 1) != 0;
+        final boolean hasLights = version >= VERSION && (flags & FLAG_HAS_LIGHTS) != 0;
+        final boolean hasHeightmaps = version >= VERSION && (flags & FLAG_HAS_HEIGHTMAPS) != 0;
         final int minSection = buffer.read(SHORT);
         final int sectionCount = buffer.read(BYTE) & 0xFF;
 
@@ -119,6 +157,43 @@ public final class SolarChunkCodec {
             final Palette biomePalette = hasBiomes ? buffer.read(biomeSerializer) : Palette.biomes();
             sections.add(new Section(blockPalette, biomePalette));
         }
-        return new Decoded(minSection, sections);
+        final List<SectionLight> lights = new ArrayList<>(sectionCount);
+        if (hasLights) {
+            for (int i = 0; i < sectionCount; i++) {
+                lights.add(readLight(buffer));
+            }
+        } else {
+            for (int i = 0; i < sectionCount; i++) lights.add(new SectionLight(new byte[0], new byte[0]));
+        }
+        final long[][] heightmaps = hasHeightmaps ? new long[][] {readHeightmap(buffer), readHeightmap(buffer)} : new long[0][];
+        return new Decoded(minSection, sections, lights, heightmaps, !hasLights);
+    }
+
+    private static void writeLight(NetworkBuffer buffer, byte[] sky, byte[] block) {
+        final boolean hasSky = sky != null && sky.length == LIGHT_ARRAY_BYTES;
+        final boolean hasBlock = block != null && block.length == LIGHT_ARRAY_BYTES;
+        buffer.write(BYTE, (byte) ((hasSky ? 1 : 0) | (hasBlock ? 2 : 0)));
+        if (hasSky) for (byte value : sky) buffer.write(BYTE, value);
+        if (hasBlock) for (byte value : block) buffer.write(BYTE, value);
+    }
+
+    private static SectionLight readLight(NetworkBuffer buffer) {
+        final byte flags = buffer.read(BYTE);
+        if ((flags & ~3) != 0) throw new MalformedChunkException("Solar chunk blob: invalid light flags");
+        final byte[] sky = (flags & 1) != 0 ? readLightArray(buffer) : new byte[0];
+        final byte[] block = (flags & 2) != 0 ? readLightArray(buffer) : new byte[0];
+        return new SectionLight(sky, block);
+    }
+
+    private static byte[] readLightArray(NetworkBuffer buffer) {
+        final byte[] result = new byte[LIGHT_ARRAY_BYTES];
+        for (int i = 0; i < result.length; i++) result[i] = buffer.read(BYTE);
+        return result;
+    }
+
+    private static long[] readHeightmap(NetworkBuffer buffer) {
+        long[] result = new long[HEIGHTMAP_LONGS];
+        for (int i = 0; i < result.length; i++) result[i] = buffer.read(LONG);
+        return result;
     }
 }

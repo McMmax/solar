@@ -1,7 +1,7 @@
 //! Versioned Solar chunk-frame wire/storage envelope, pure-Rust fold engine, and frame ownership model.
 
-use std::sync::Arc;
 use crate::SolarChunkFrame;
+use std::sync::Arc;
 
 /// Envelope magic signature ("SOLR").
 pub const SOLAR_MAGIC: [u8; 4] = *b"SOLR";
@@ -29,7 +29,10 @@ pub enum SolarCodecError {
     /// Input buffer is truncated (fewer bytes than header or declared payload length).
     TruncatedBuffer { needed: usize, available: usize },
     /// Invalid revision ordering (`base_revision > applied_revision`).
-    InvalidRevisionSequence { base_revision: u64, applied_revision: u64 },
+    InvalidRevisionSequence {
+        base_revision: u64,
+        applied_revision: u64,
+    },
     /// Corrupted payload internal formatting.
     CorruptedPayload { reason: String },
 }
@@ -41,19 +44,40 @@ impl std::fmt::Display for SolarCodecError {
                 write!(f, "invalid Solar magic header: {:?}", found)
             }
             Self::UnsupportedVersion { version } => {
-                write!(f, "unsupported Solar envelope version: {version} (expected {CURRENT_SOLAR_VERSION})")
+                write!(
+                    f,
+                    "unsupported Solar envelope version: {version} (expected {CURRENT_SOLAR_VERSION})"
+                )
             }
-            Self::ChecksumMismatch { expected, calculated } => {
-                write!(f, "Solar envelope checksum mismatch: header 0x{expected:08X} != computed 0x{calculated:08X}")
+            Self::ChecksumMismatch {
+                expected,
+                calculated,
+            } => {
+                write!(
+                    f,
+                    "Solar envelope checksum mismatch: header 0x{expected:08X} != computed 0x{calculated:08X}"
+                )
             }
             Self::PayloadTooLarge { size, max_allowed } => {
-                write!(f, "Solar payload too large: {size} bytes exceeds limit of {max_allowed} bytes")
+                write!(
+                    f,
+                    "Solar payload too large: {size} bytes exceeds limit of {max_allowed} bytes"
+                )
             }
             Self::TruncatedBuffer { needed, available } => {
-                write!(f, "truncated Solar envelope buffer: needed {needed} bytes, but only {available} available")
+                write!(
+                    f,
+                    "truncated Solar envelope buffer: needed {needed} bytes, but only {available} available"
+                )
             }
-            Self::InvalidRevisionSequence { base_revision, applied_revision } => {
-                write!(f, "invalid revision sequence: base ({base_revision}) > applied ({applied_revision})")
+            Self::InvalidRevisionSequence {
+                base_revision,
+                applied_revision,
+            } => {
+                write!(
+                    f,
+                    "invalid revision sequence: base ({base_revision}) > applied ({applied_revision})"
+                )
             }
             Self::CorruptedPayload { reason } => {
                 write!(f, "corrupted Solar payload: {reason}")
@@ -283,11 +307,32 @@ pub fn fold_chunk_frame(frame: &SolarChunkFrame) -> Result<SolarFoldedChunk, Sol
     }
 
     // Fold base snapshot + serialized edits into a unified compacted buffer
-    let mut folded_bytes = frame.base_data.clone();
+    // Check if base_data already contains an existing fold trailer magic [0xFF, 0xFE, 0xFD, 0xFC]
+    const TRAILER_MAGIC: [u8; 4] = [0xFF, 0xFE, 0xFD, 0xFC];
+    let (clean_base, existing_edits) = if let Some(pos) = frame.base_data.windows(4).position(|w| w == TRAILER_MAGIC) {
+        let base_slice = &frame.base_data[..pos];
+        let mut edits_bytes = Vec::new();
+        if frame.base_data.len() >= pos + 8 {
+            let count = u32::from_be_bytes(frame.base_data[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            let edit_payload = &frame.base_data[pos + 8..];
+            // each edit is 1 + 2 + 1 + 4 = 8 bytes
+            if edit_payload.len() >= count * 8 {
+                edits_bytes.extend_from_slice(&edit_payload[..count * 8]);
+            }
+        }
+        (base_slice.to_vec(), edits_bytes)
+    } else {
+        (frame.base_data.clone(), Vec::new())
+    };
 
-    // Append edit metadata tail
-    folded_bytes.extend_from_slice(&[0xFF, 0xFE, 0xFD, 0xFC]); // Fold trailer magic
-    folded_bytes.extend_from_slice(&(total_edits as u32).to_be_bytes());
+    let existing_count = existing_edits.len() / 8;
+    let new_edits: usize = frame.ordered_patches.iter().map(|p| p.edits.len()).sum();
+    let combined_edits = existing_count + new_edits;
+
+    let mut folded_bytes = clean_base;
+    folded_bytes.extend_from_slice(&TRAILER_MAGIC);
+    folded_bytes.extend_from_slice(&(combined_edits as u32).to_be_bytes());
+    folded_bytes.extend_from_slice(&existing_edits);
 
     for patch in &frame.ordered_patches {
         for edit in &patch.edits {

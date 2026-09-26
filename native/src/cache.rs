@@ -1,8 +1,11 @@
 //! Bounded native chunk cache, byte-accurate accounting, LRU eviction, and pinning.
 
-use std::collections::HashMap;
+use crate::{
+    SolarChunkBase, SolarChunkFrame, SolarChunkHead, SolarChunkPatch, SolarReadError,
+    reconstruct_chunk_frame,
+};
 use solar_schema::unpack_chunk_key;
-use crate::{reconstruct_chunk_frame, SolarChunkBase, SolarChunkFrame, SolarChunkHead, SolarChunkPatch, SolarReadError};
+use std::collections::HashMap;
 
 /// Configuration parameters for native cache limits and eviction thresholds.
 #[derive(Clone, Debug)]
@@ -20,7 +23,7 @@ pub struct SolarCacheConfig {
 impl Default for SolarCacheConfig {
     fn default() -> Self {
         Self {
-            max_world_bytes: 64 * 1024 * 1024,   // 64 MB
+            max_world_bytes: 64 * 1024 * 1024, // 64 MB
             max_world_frames: 4096,
             max_global_bytes: 256 * 1024 * 1024, // 256 MB
             max_global_frames: 16384,
@@ -98,7 +101,12 @@ impl SolarWorldCacheState {
     }
 
     /// Inserts or replaces a cached frame, updating byte tracking.
-    pub fn insert_entry(&mut self, chunk_key: u128, frame: SolarChunkFrame, access_seq: u64) -> usize {
+    pub fn insert_entry(
+        &mut self,
+        chunk_key: u128,
+        frame: SolarChunkFrame,
+        access_seq: u64,
+    ) -> usize {
         let new_entry = SolarCachedEntry::new(frame, access_seq);
         let added_bytes = new_entry.byte_size;
 
@@ -168,11 +176,12 @@ impl SolarNativeCache {
     /// Attaches a world to the native cache.
     /// Returns `true` if newly attached, `false` if already present.
     pub fn attach_world(&mut self, world_key: u64) -> bool {
-        if self.attached_worlds.contains_key(&world_key) {
-            false
-        } else {
-            self.attached_worlds.insert(world_key, SolarWorldCacheState::new(world_key));
+        if let std::collections::hash_map::Entry::Vacant(e) = self.attached_worlds.entry(world_key)
+        {
+            e.insert(SolarWorldCacheState::new(world_key));
             true
+        } else {
+            false
         }
     }
 
@@ -180,8 +189,12 @@ impl SolarNativeCache {
     /// Returns `true` if world was attached, `false` otherwise.
     pub fn detach_world(&mut self, world_key: u64) -> bool {
         if let Some(state) = self.attached_worlds.remove(&world_key) {
-            self.metrics.current_bytes = self.metrics.current_bytes.saturating_sub(state.total_bytes);
-            self.metrics.current_frames = self.metrics.current_frames.saturating_sub(state.entries.len());
+            self.metrics.current_bytes =
+                self.metrics.current_bytes.saturating_sub(state.total_bytes);
+            self.metrics.current_frames = self
+                .metrics
+                .current_frames
+                .saturating_sub(state.entries.len());
             for entry in state.entries.values() {
                 if entry.is_pinned() {
                     self.metrics.pinned_frames = self.metrics.pinned_frames.saturating_sub(1);
@@ -228,14 +241,14 @@ impl SolarNativeCache {
     /// Increments the chunk's pin reference count.
     pub fn pin_chunk(&mut self, chunk_key: u128) -> bool {
         let (world_key, _, _) = unpack_chunk_key(chunk_key);
-        if let Some(state) = self.attached_worlds.get_mut(&world_key) {
-            if let Some(entry) = state.entries.get_mut(&chunk_key) {
-                if entry.pin_count == 0 {
-                    self.metrics.pinned_frames += 1;
-                }
-                entry.pin_count += 1;
-                return true;
+        if let Some(state) = self.attached_worlds.get_mut(&world_key)
+            && let Some(entry) = state.entries.get_mut(&chunk_key)
+        {
+            if entry.pin_count == 0 {
+                self.metrics.pinned_frames += 1;
             }
+            entry.pin_count += 1;
+            return true;
         }
         false
     }
@@ -243,16 +256,15 @@ impl SolarNativeCache {
     /// Decrements the chunk's pin reference count. Once zero, the chunk becomes eligible for LRU eviction.
     pub fn unpin_chunk(&mut self, chunk_key: u128) -> bool {
         let (world_key, _, _) = unpack_chunk_key(chunk_key);
-        if let Some(state) = self.attached_worlds.get_mut(&world_key) {
-            if let Some(entry) = state.entries.get_mut(&chunk_key) {
-                if entry.pin_count > 0 {
-                    entry.pin_count -= 1;
-                    if entry.pin_count == 0 {
-                        self.metrics.pinned_frames = self.metrics.pinned_frames.saturating_sub(1);
-                    }
-                    return true;
-                }
+        if let Some(state) = self.attached_worlds.get_mut(&world_key)
+            && let Some(entry) = state.entries.get_mut(&chunk_key)
+            && entry.pin_count > 0
+        {
+            entry.pin_count -= 1;
+            if entry.pin_count == 0 {
+                self.metrics.pinned_frames = self.metrics.pinned_frames.saturating_sub(1);
             }
+            return true;
         }
         false
     }
@@ -271,16 +283,18 @@ impl SolarNativeCache {
     /// If the head revision has advanced, any cached frame for this chunk is invalidated.
     pub fn on_chunk_head_updated(&mut self, head: &SolarChunkHead) {
         if let Some(state) = self.attached_worlds.get_mut(&head.world_key) {
-            let prev = state.head_revisions.insert(head.chunk_key, head.applied_revision);
-            if let Some(prev_rev) = prev {
-                if prev_rev != head.applied_revision {
-                    if let Some(removed) = state.remove_entry(&head.chunk_key) {
-                        self.metrics.current_bytes = self.metrics.current_bytes.saturating_sub(removed.byte_size);
-                        self.metrics.current_frames = self.metrics.current_frames.saturating_sub(1);
-                        if removed.is_pinned() {
-                            self.metrics.pinned_frames = self.metrics.pinned_frames.saturating_sub(1);
-                        }
-                    }
+            let prev = state
+                .head_revisions
+                .insert(head.chunk_key, head.applied_revision);
+            if let Some(prev_rev) = prev
+                && prev_rev != head.applied_revision
+                && let Some(removed) = state.remove_entry(&head.chunk_key)
+            {
+                self.metrics.current_bytes =
+                    self.metrics.current_bytes.saturating_sub(removed.byte_size);
+                self.metrics.current_frames = self.metrics.current_frames.saturating_sub(1);
+                if removed.is_pinned() {
+                    self.metrics.pinned_frames = self.metrics.pinned_frames.saturating_sub(1);
                 }
             }
         }
@@ -300,14 +314,13 @@ impl SolarNativeCache {
 
         // 1. Check for fast cache hit
         if let Some(state) = self.attached_worlds.get_mut(&world_key) {
-            if let Some(h) = head {
-                if let Some(entry) = state.entries.get_mut(&chunk_key) {
-                    if entry.frame.applied_revision == h.applied_revision {
-                        entry.last_access_seq = access_seq;
-                        self.metrics.cache_hits += 1;
-                        return Ok(entry.frame.clone());
-                    }
-                }
+            if let Some(h) = head
+                && let Some(entry) = state.entries.get_mut(&chunk_key)
+                && entry.frame.applied_revision == h.applied_revision
+            {
+                entry.last_access_seq = access_seq;
+                self.metrics.cache_hits += 1;
+                return Ok(entry.frame.clone());
             }
         } else {
             return Err(SolarReadError::NotFound { chunk_key });
@@ -322,7 +335,9 @@ impl SolarNativeCache {
 
         // 3. Store frame and update metrics
         if let Some(state) = self.attached_worlds.get_mut(&world_key) {
-            state.head_revisions.insert(chunk_key, frame.applied_revision);
+            state
+                .head_revisions
+                .insert(chunk_key, frame.applied_revision);
             let prev_entry = state.remove_entry(&chunk_key);
             if let Some(p) = prev_entry {
                 self.metrics.current_bytes = self.metrics.current_bytes.saturating_sub(p.byte_size);
@@ -346,15 +361,16 @@ impl SolarNativeCache {
     /// Explicitly invalidates a cached chunk frame by packed `chunk_key`.
     pub fn invalidate_chunk(&mut self, chunk_key: u128) -> bool {
         let (world_key, _, _) = unpack_chunk_key(chunk_key);
-        if let Some(state) = self.attached_worlds.get_mut(&world_key) {
-            if let Some(removed) = state.remove_entry(&chunk_key) {
-                self.metrics.current_bytes = self.metrics.current_bytes.saturating_sub(removed.byte_size);
-                self.metrics.current_frames = self.metrics.current_frames.saturating_sub(1);
-                if removed.is_pinned() {
-                    self.metrics.pinned_frames = self.metrics.pinned_frames.saturating_sub(1);
-                }
-                return true;
+        if let Some(state) = self.attached_worlds.get_mut(&world_key)
+            && let Some(removed) = state.remove_entry(&chunk_key)
+        {
+            self.metrics.current_bytes =
+                self.metrics.current_bytes.saturating_sub(removed.byte_size);
+            self.metrics.current_frames = self.metrics.current_frames.saturating_sub(1);
+            if removed.is_pinned() {
+                self.metrics.pinned_frames = self.metrics.pinned_frames.saturating_sub(1);
             }
+            return true;
         }
         false
     }
@@ -363,7 +379,9 @@ impl SolarNativeCache {
     fn enforce_eviction_limits(&mut self, target_world_key: u64) {
         // 1. Per-world eviction
         if let Some(state) = self.attached_worlds.get_mut(&target_world_key) {
-            while state.total_bytes > self.config.max_world_bytes || state.entries.len() > self.config.max_world_frames {
+            while state.total_bytes > self.config.max_world_bytes
+                || state.entries.len() > self.config.max_world_frames
+            {
                 // Find oldest unpinned entry in target world
                 let oldest_unpinned = state
                     .entries
@@ -376,7 +394,8 @@ impl SolarNativeCache {
                     if let Some(removed) = state.remove_entry(&evict_key) {
                         self.metrics.evictions_lru += 1;
                         self.metrics.evicted_bytes += removed.byte_size as u64;
-                        self.metrics.current_bytes = self.metrics.current_bytes.saturating_sub(removed.byte_size);
+                        self.metrics.current_bytes =
+                            self.metrics.current_bytes.saturating_sub(removed.byte_size);
                         self.metrics.current_frames = self.metrics.current_frames.saturating_sub(1);
                     }
                 } else {
@@ -409,13 +428,14 @@ impl SolarNativeCache {
             }
 
             if let Some((w_key, c_key, _)) = global_oldest {
-                if let Some(state) = self.attached_worlds.get_mut(&w_key) {
-                    if let Some(removed) = state.remove_entry(&c_key) {
-                        self.metrics.evictions_lru += 1;
-                        self.metrics.evicted_bytes += removed.byte_size as u64;
-                        self.metrics.current_bytes = self.metrics.current_bytes.saturating_sub(removed.byte_size);
-                        self.metrics.current_frames = self.metrics.current_frames.saturating_sub(1);
-                    }
+                if let Some(state) = self.attached_worlds.get_mut(&w_key)
+                    && let Some(removed) = state.remove_entry(&c_key)
+                {
+                    self.metrics.evictions_lru += 1;
+                    self.metrics.evicted_bytes += removed.byte_size as u64;
+                    self.metrics.current_bytes =
+                        self.metrics.current_bytes.saturating_sub(removed.byte_size);
+                    self.metrics.current_frames = self.metrics.current_frames.saturating_sub(1);
                 }
             } else {
                 // All globally cached frames are pinned; cannot evict further
@@ -424,3 +444,302 @@ impl SolarNativeCache {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solar_schema::pack_chunk_key;
+    use spacetimedb_sdk::Timestamp;
+
+    #[allow(dead_code)]
+    fn make_test_frame(world_key: u64, chunk_x: i32, chunk_z: i32, size: usize) -> SolarChunkFrame {
+        let chunk_key = pack_chunk_key(world_key, chunk_x, chunk_z);
+        SolarChunkFrame {
+            chunk_key,
+            world_key,
+            chunk_x,
+            chunk_z,
+            applied_revision: 0,
+            base_revision: 0,
+            base_data: vec![0xAA; size],
+            ordered_patches: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_byte_bounds_enforced() {
+        let config = SolarCacheConfig {
+            max_world_bytes: 1000,
+            max_world_frames: 100,
+            max_global_bytes: 5000,
+            max_global_frames: 100,
+        };
+        let mut cache = SolarNativeCache::new(config);
+        assert!(cache.attach_world(1));
+
+        let k1 = pack_chunk_key(1, 0, 0);
+        let k2 = pack_chunk_key(1, 1, 0);
+        let k3 = pack_chunk_key(1, 2, 0);
+
+        let mk_base = |key, x, sz| SolarChunkBase {
+            chunk_key: key,
+            world_key: 1,
+            chunk_x: x,
+            chunk_z: 0,
+            data: vec![0xBB; sz],
+            base_revision: 0,
+            created_at: Timestamp::from_micros_since_unix_epoch(1),
+            updated_at: Timestamp::from_micros_since_unix_epoch(1),
+        };
+        let mk_head = |key, x| SolarChunkHead {
+            chunk_key: key,
+            world_key: 1,
+            chunk_x: x,
+            chunk_z: 0,
+            applied_revision: 0,
+            base_revision: 0,
+            patch_count: 0,
+            updated_at: Timestamp::from_micros_since_unix_epoch(1),
+            last_actor: "test".to_string(),
+        };
+
+        // Each frame approx size will be around 400+ bytes
+        cache.get_or_reconstruct(k1, Some(&mk_base(k1, 0, 400)), Some(&mk_head(k1, 0)), &[]).unwrap();
+        cache.get_or_reconstruct(k2, Some(&mk_base(k2, 1, 400)), Some(&mk_head(k2, 1)), &[]).unwrap();
+
+        assert_eq!(cache.cached_frame_count(1), 2);
+        assert!(cache.cached_byte_count(1) <= 1000);
+
+        // Inserting k3 exceeds max_world_bytes (400 * 3 > 1000), evicting k1 (LRU)
+        cache.get_or_reconstruct(k3, Some(&mk_base(k3, 2, 400)), Some(&mk_head(k3, 2)), &[]).unwrap();
+
+        assert_eq!(cache.cached_frame_count(1), 2);
+        assert!(cache.cached_byte_count(1) <= 1000);
+        assert_eq!(cache.metrics().evictions_lru, 1);
+        assert!(cache.metrics().evicted_bytes > 0);
+    }
+
+    #[test]
+    fn test_active_authority_data_never_evicted() {
+        let config = SolarCacheConfig {
+            max_world_bytes: 500,
+            max_world_frames: 2,
+            max_global_bytes: 1000,
+            max_global_frames: 4,
+        };
+        let mut cache = SolarNativeCache::new(config);
+        cache.attach_world(1);
+
+        let k1 = pack_chunk_key(1, 0, 0);
+        let k2 = pack_chunk_key(1, 1, 0);
+        let k3 = pack_chunk_key(1, 2, 0);
+
+        let mk_base = |key, x| SolarChunkBase {
+            chunk_key: key,
+            world_key: 1,
+            chunk_x: x,
+            chunk_z: 0,
+            data: vec![0xCC; 10],
+            base_revision: 0,
+            created_at: Timestamp::from_micros_since_unix_epoch(1),
+            updated_at: Timestamp::from_micros_since_unix_epoch(1),
+        };
+        let mk_head = |key, x| SolarChunkHead {
+            chunk_key: key,
+            world_key: 1,
+            chunk_x: x,
+            chunk_z: 0,
+            applied_revision: 0,
+            base_revision: 0,
+            patch_count: 0,
+            updated_at: Timestamp::from_micros_since_unix_epoch(1),
+            last_actor: "test".to_string(),
+        };
+
+        cache.get_or_reconstruct(k1, Some(&mk_base(k1, 0)), Some(&mk_head(k1, 0)), &[]).unwrap();
+        cache.get_or_reconstruct(k2, Some(&mk_base(k2, 1)), Some(&mk_head(k2, 1)), &[]).unwrap();
+
+        // Pin k1 (oldest)
+        assert!(cache.pin_chunk(k1));
+        assert!(cache.is_chunk_pinned(k1));
+
+        // Insert k3 -> would evict oldest (k1), but k1 is pinned so k2 is evicted
+        cache.get_or_reconstruct(k3, Some(&mk_base(k3, 2)), Some(&mk_head(k3, 2)), &[]).unwrap();
+
+        assert_eq!(cache.cached_frame_count(1), 2);
+        assert!(cache.is_chunk_pinned(k1));
+    }
+
+    #[test]
+    fn test_pin_tokens_release_exactly_once() {
+        let mut cache = SolarNativeCache::default();
+        cache.attach_world(1);
+        let k1 = pack_chunk_key(1, 0, 0);
+
+        let base = SolarChunkBase {
+            chunk_key: k1,
+            world_key: 1,
+            chunk_x: 0,
+            chunk_z: 0,
+            data: vec![0xDD; 10],
+            base_revision: 0,
+            created_at: Timestamp::from_micros_since_unix_epoch(1),
+            updated_at: Timestamp::from_micros_since_unix_epoch(1),
+        };
+        let head = SolarChunkHead {
+            chunk_key: k1,
+            world_key: 1,
+            chunk_x: 0,
+            chunk_z: 0,
+            applied_revision: 0,
+            base_revision: 0,
+            patch_count: 0,
+            updated_at: Timestamp::from_micros_since_unix_epoch(1),
+            last_actor: "test".to_string(),
+        };
+
+        cache.get_or_reconstruct(k1, Some(&base), Some(&head), &[]).unwrap();
+
+        // Double pin
+        assert!(cache.pin_chunk(k1));
+        assert!(cache.pin_chunk(k1));
+        assert_eq!(cache.metrics().pinned_frames, 1);
+        assert!(cache.is_chunk_pinned(k1));
+
+        // First unpin -> still pinned (refcount = 1)
+        assert!(cache.unpin_chunk(k1));
+        assert!(cache.is_chunk_pinned(k1));
+        assert_eq!(cache.metrics().pinned_frames, 1);
+
+        // Second unpin -> unpinned (refcount = 0)
+        assert!(cache.unpin_chunk(k1));
+        assert!(!cache.is_chunk_pinned(k1));
+        assert_eq!(cache.metrics().pinned_frames, 0);
+
+        // Third unpin -> false (no active pins)
+        assert!(!cache.unpin_chunk(k1));
+        assert_eq!(cache.metrics().pinned_frames, 0);
+    }
+
+    #[test]
+    fn test_detach_reclaims_memory() {
+        let mut cache = SolarNativeCache::default();
+        cache.attach_world(1);
+        cache.attach_world(2);
+
+        let k1 = pack_chunk_key(1, 0, 0);
+        let k2 = pack_chunk_key(2, 0, 0);
+
+        let base1 = SolarChunkBase {
+            chunk_key: k1,
+            world_key: 1,
+            chunk_x: 0,
+            chunk_z: 0,
+            data: vec![0x11; 50],
+            base_revision: 0,
+            created_at: Timestamp::from_micros_since_unix_epoch(1),
+            updated_at: Timestamp::from_micros_since_unix_epoch(1),
+        };
+        let head1 = SolarChunkHead {
+            chunk_key: k1,
+            world_key: 1,
+            chunk_x: 0,
+            chunk_z: 0,
+            applied_revision: 0,
+            base_revision: 0,
+            patch_count: 0,
+            updated_at: Timestamp::from_micros_since_unix_epoch(1),
+            last_actor: "test".to_string(),
+        };
+
+        let base2 = SolarChunkBase {
+            chunk_key: k2,
+            world_key: 2,
+            chunk_x: 0,
+            chunk_z: 0,
+            data: vec![0x22; 50],
+            base_revision: 0,
+            created_at: Timestamp::from_micros_since_unix_epoch(1),
+            updated_at: Timestamp::from_micros_since_unix_epoch(1),
+        };
+        let head2 = SolarChunkHead {
+            chunk_key: k2,
+            world_key: 2,
+            chunk_x: 0,
+            chunk_z: 0,
+            applied_revision: 0,
+            base_revision: 0,
+            patch_count: 0,
+            updated_at: Timestamp::from_micros_since_unix_epoch(1),
+            last_actor: "test".to_string(),
+        };
+
+        cache.get_or_reconstruct(k1, Some(&base1), Some(&head1), &[]).unwrap();
+        cache.get_or_reconstruct(k2, Some(&base2), Some(&head2), &[]).unwrap();
+        cache.pin_chunk(k1);
+
+        assert_eq!(cache.active_world_count(), 2);
+        assert_eq!(cache.metrics().current_frames, 2);
+        assert_eq!(cache.metrics().pinned_frames, 1);
+        assert!(cache.metrics().current_bytes > 0);
+
+        // Detach world 1
+        assert!(cache.detach_world(1));
+        assert_eq!(cache.active_world_count(), 1);
+        assert_eq!(cache.metrics().current_frames, 1);
+        assert_eq!(cache.metrics().pinned_frames, 0);
+        assert!(!cache.is_world_attached(1));
+        assert!(cache.is_world_attached(2));
+
+        // Detach world 2
+        assert!(cache.detach_world(2));
+        assert_eq!(cache.active_world_count(), 0);
+        assert_eq!(cache.metrics().current_frames, 0);
+        assert_eq!(cache.metrics().current_bytes, 0);
+    }
+
+    #[test]
+    fn test_bounded_growth_under_continuous_insertions() {
+        let config = SolarCacheConfig {
+            max_world_bytes: 2000,
+            max_world_frames: 5,
+            max_global_bytes: 4000,
+            max_global_frames: 10,
+        };
+        let mut cache = SolarNativeCache::new(config);
+        cache.attach_world(1);
+
+        for i in 0..100 {
+            let k = pack_chunk_key(1, i, 0);
+            let base = SolarChunkBase {
+                chunk_key: k,
+                world_key: 1,
+                chunk_x: i,
+                chunk_z: 0,
+                data: vec![0xEE; 100],
+                base_revision: 0,
+                created_at: Timestamp::from_micros_since_unix_epoch(1),
+                updated_at: Timestamp::from_micros_since_unix_epoch(1),
+            };
+            let head = SolarChunkHead {
+                chunk_key: k,
+                world_key: 1,
+                chunk_x: i,
+                chunk_z: 0,
+                applied_revision: 0,
+                base_revision: 0,
+                patch_count: 0,
+                updated_at: Timestamp::from_micros_since_unix_epoch(1),
+                last_actor: "test".to_string(),
+            };
+            cache.get_or_reconstruct(k, Some(&base), Some(&head), &[]).unwrap();
+
+            assert!(cache.cached_frame_count(1) <= 5);
+            assert!(cache.metrics().current_bytes <= 2000);
+        }
+
+        assert_eq!(cache.cached_frame_count(1), 5);
+        assert_eq!(cache.metrics().evictions_lru, 95);
+    }
+}
+

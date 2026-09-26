@@ -1814,6 +1814,7 @@ name = "solar-bridge"
 version = "0.1.0"
 dependencies = [
  "minestom-stdb",
+ "serde_json",
  "solar-schema",
  "spacetimedb-sdk",
 ]

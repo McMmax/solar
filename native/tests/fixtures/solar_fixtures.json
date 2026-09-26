@@ -1,0 +1,62 @@
+{
+  "fixtures": {
+    "all_air_chunk": {
+      "type": "chunk",
+      "description": "A chunk composed entirely of air.",
+      "digest": "d3b07384d113edec49eaa6238ad5ff00",
+      "edits": []
+    },
+    "Lobby": {
+      "type": "chunk",
+      "description": "Lobby template chunk.",
+      "digest": "deadbeefdeadbeefdeadbeefdeadbeef",
+      "edits": [{"x": 1, "y": 64, "z": 1, "state": 2}]
+    },
+    "Soupkitz": {
+      "type": "chunk",
+      "description": "Soupkitz arena chunk.",
+      "digest": "cafebabecafebabecafebabecafebabe",
+      "edits": [{"x": 5, "y": 100, "z": 5, "state": 3}]
+    },
+    "fluid_sign": {
+      "type": "chunk",
+      "description": "Chunk with fluid and sign block entity.",
+      "digest": "f101d000f101d000f101d000f101d000",
+      "edits": [{"x": 2, "y": 65, "z": 2, "state": 8, "nbt": "{id:\"minecraft:sign\"}"}]
+    },
+    "cross_chunk_placement": {
+      "type": "multi_chunk",
+      "description": "Placements that span across chunk boundaries.",
+      "digest": "c4055c4055c4055c4055c4055c4055c4",
+      "edits": [
+        {"chunk_x": 0, "chunk_z": 0, "x": 15, "y": 10, "z": 15, "state": 1},
+        {"chunk_x": 1, "chunk_z": 0, "x": 0, "y": 10, "z": 15, "state": 1}
+      ]
+    },
+    "malformed_payload": {
+      "type": "error",
+      "description": "A payload that is malformed and should be rejected.",
+      "digest": "badbadbadbadbadbadbadbadbadbadba",
+      "payload": "invalid_base64_or_bytes"
+    },
+    "world_edit_janitor": {
+      "type": "chunk",
+      "description": "A large WorldEdit block placement.",
+      "digest": "99999999999999999999999999999999",
+      "edits": [
+        {"x": 0, "y": 10, "z": 0, "state": 1},
+        {"x": 0, "y": 10, "z": 1, "state": 1},
+        {"x": 0, "y": 10, "z": 2, "state": 1}
+      ]
+    },
+    "replay": {
+      "type": "sequence",
+      "description": "Replay of an event sequence.",
+      "digest": "stable_replay_digest_1234567890a",
+      "patches": [
+        {"id": 1, "edits": [{"x": 0, "y": 0, "z": 0, "state": 1}]},
+        {"id": 2, "edits": [{"x": 0, "y": 0, "z": 0, "state": 2}]}
+      ]
+    }
+  }
+}

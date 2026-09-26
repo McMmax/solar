@@ -18,4 +18,7 @@ solar-schema = { path = "../schema" }
 # The generated Rust client for spacetime/coldmain (table/reducer bindings). Same crate
 # platforms/stomzy/spacetime/native depends on — solar-bridge reads/writes through it, it
 # does not generate or own a second copy.
-minestom-stdb = { path = "../../../platforms/stomzy/spacetime/stdb", default-features = false, features = ["client"] }
+minestom-stdb = { path = "../../../stomzy/spacetime/stdb", default-features = false, features = ["client"] }
+
+[dev-dependencies]
+serde_json = "1"

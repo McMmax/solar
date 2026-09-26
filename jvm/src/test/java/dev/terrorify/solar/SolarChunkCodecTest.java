@@ -42,6 +42,8 @@ class SolarChunkCodecTest {
 
         assertEquals(minSection, decoded.minSection());
         assertEquals(original.size(), decoded.sections().size());
+        assertEquals(original.size(), decoded.lights().size());
+        assertTrue(!decoded.legacyLighting());
 
         for (int i = 0; i < original.size(); i++) {
             final Palette expected = original.get(i).blockPalette();
@@ -56,11 +58,29 @@ class SolarChunkCodecTest {
         MinecraftServer.init();
 
         final byte[] encoded = SolarChunkCodec.encode(0, List.of(new Section()));
-        // header(4+1+1+2+1=9) + one present byte = 10 bytes total.
-        assertEquals(10, encoded.length);
+        // header(4+1+1+2+1=9) + one present byte + one empty light-flags byte.
+        assertEquals(11, encoded.length);
 
         final SolarChunkCodec.Decoded decoded = SolarChunkCodec.decode(encoded);
         assertEquals(Block.AIR.stateId(), decoded.sections().get(0).blockPalette().singleValue());
+        assertEquals(0, decoded.lights().get(0).skyLight().length);
+        assertEquals(0, decoded.lights().get(0).blockLight().length);
+    }
+
+    @Test
+    void preservesImportedAnvilLightArrays() {
+        MinecraftServer.init();
+        Section section = new Section();
+        byte[] sky = new byte[2048];
+        byte[] block = new byte[2048];
+        sky[0] = (byte) 0xF0;
+        block[2047] = 0x0F;
+        section.setSkyLight(sky);
+        section.setBlockLight(block);
+
+        SolarChunkCodec.Decoded decoded = SolarChunkCodec.decode(SolarChunkCodec.encode(0, List.of(section)));
+        assertEquals((byte) 0xF0, decoded.lights().getFirst().skyLight()[0]);
+        assertEquals((byte) 0x0F, decoded.lights().getFirst().blockLight()[2047]);
     }
 
     @Test

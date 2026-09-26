@@ -6,15 +6,15 @@
 //! - Pure reconstruction logic avoids allocating JVM objects or performing unneeded codecs.
 
 pub use solar_schema::{
-    pack_chunk_key, unpack_chunk_key, SolarAuthContext, SolarAuthError, SolarBlockEdit,
-    SolarChunkBase, SolarChunkHead, SolarChunkPatch, SolarCompactionRequest, SolarWorld,
-    COMPACTION_THRESHOLD_PATCHES, MAX_EDITS_PER_PATCH,
+    COMPACTION_THRESHOLD_PATCHES, IMPORT_PHASE_COMPLETED, IMPORT_PHASE_DISCOVERY,
+    IMPORT_PHASE_FAILED, IMPORT_PHASE_STREAMING_BASE, IMPORT_PHASE_VALIDATING,
+    MAX_EDITS_PER_PATCH, SolarAuthContext, SolarAuthError, SolarBlockEdit, SolarChunkBase,
+    SolarChunkHead, SolarChunkPatch, SolarCompactionRequest, SolarWorld, WORLD_STATUS_ACTIVE,
+    WORLD_STATUS_FAILED, WORLD_STATUS_FALLBACK, WORLD_STATUS_IMPORTING, pack_chunk_key,
+    unpack_chunk_key,
 };
 
-use minestom_stdb::{
-    backend_server_link_native_identity_reducer::backend_server_link_native_identity as BackendServerLinkNativeIdentityExt,
-    DbConnection, SubscriptionHandle,
-};
+use minestom_stdb::{DbConnection, SubscriptionHandle};
 use spacetimedb_sdk::DbContext;
 
 /// Error types returned by the Solar native read contract.
@@ -65,7 +65,10 @@ impl std::fmt::Display for SolarReadError {
                 )
             }
             Self::EmptyBaseData { chunk_key } => {
-                write!(f, "Solar chunk 0x{chunk_key:032X} has empty base data payload")
+                write!(
+                    f,
+                    "Solar chunk 0x{chunk_key:032X} has empty base data payload"
+                )
             }
         }
     }
@@ -193,6 +196,7 @@ pub fn reconstruct_chunk_frame(
             let mut expected_rev = h.base_revision + 1;
             let mut ordered_patches = Vec::with_capacity(relevant_patches.len());
 
+            #[allow(clippy::explicit_counter_loop)]
             for p in relevant_patches {
                 if p.revision != expected_rev {
                     return Err(SolarReadError::RevisionGap {
@@ -207,6 +211,14 @@ pub fn reconstruct_chunk_frame(
                     actor: p.actor.clone(),
                 });
                 expected_rev += 1;
+            }
+
+            if expected_rev - 1 != h.applied_revision {
+                return Err(SolarReadError::RevisionGap {
+                    chunk_key,
+                    expected_revision: expected_rev,
+                    found_revision: h.applied_revision,
+                });
             }
 
             Ok(SolarChunkFrame {
@@ -225,11 +237,17 @@ pub fn reconstruct_chunk_frame(
 
 pub mod cache;
 pub mod codec;
+pub mod export;
+pub mod import;
 pub mod interest;
+pub mod recovery;
 
 pub use cache::*;
 pub use codec::*;
+pub use export::*;
+pub use import::*;
 pub use interest::*;
+pub use recovery::*;
 
 /// Subscribes to one world's Solar v1 tables (`solar_world`, `solar_chunk_base`,
 /// `solar_chunk_head`, `solar_chunk_patch`, `solar_compaction_request`) by `world_key`.
@@ -243,16 +261,6 @@ pub fn subscribe_world(conn: &DbConnection, world_key: u64) -> SubscriptionHandl
         format!("SELECT * FROM solar_chunk_patch WHERE world_key = {world_key}"),
         format!("SELECT * FROM solar_compaction_request WHERE world_key = {world_key}"),
     ])
-}
-
-/// Link this connection's identity as the caller's native-bridge identity
-/// (`backend_server_link_native_identity`) — must be called once after connect so the
-/// Solar reducers' `assert_backend_server` auth gate accepts calls made over this
-/// connection.
-pub fn link_native_identity(conn: &DbConnection, server_id: String) -> bool {
-    conn.reducers
-        .backend_server_link_native_identity(server_id)
-        .is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -347,7 +355,10 @@ mod tests {
                 chunk_x: 0,
                 chunk_z: 0,
                 revision: 1,
-                edits: vec![SolarBlockEdit::new(0, 64, 0, 10), SolarBlockEdit::new(1, 64, 1, 11)],
+                edits: vec![
+                    SolarBlockEdit::new(0, 64, 0, 10),
+                    SolarBlockEdit::new(1, 64, 1, 11),
+                ],
                 actor: "actor_1".to_string(),
                 created_at: Timestamp::from_micros_since_unix_epoch(10),
             },
@@ -554,18 +565,28 @@ mod tests {
         };
 
         // Insert frames 1, 2, 3
-        cache.get_or_reconstruct(k1, Some(&mk_base(k1, 0)), Some(&mk_head(k1, 0)), &[]).unwrap();
-        cache.get_or_reconstruct(k2, Some(&mk_base(k2, 1)), Some(&mk_head(k2, 1)), &[]).unwrap();
-        cache.get_or_reconstruct(k3, Some(&mk_base(k3, 2)), Some(&mk_head(k3, 2)), &[]).unwrap();
+        cache
+            .get_or_reconstruct(k1, Some(&mk_base(k1, 0)), Some(&mk_head(k1, 0)), &[])
+            .unwrap();
+        cache
+            .get_or_reconstruct(k2, Some(&mk_base(k2, 1)), Some(&mk_head(k2, 1)), &[])
+            .unwrap();
+        cache
+            .get_or_reconstruct(k3, Some(&mk_base(k3, 2)), Some(&mk_head(k3, 2)), &[])
+            .unwrap();
 
         assert_eq!(cache.cached_frame_count(1), 3);
         assert_eq!(cache.metrics().evictions_lru, 0);
 
         // Touch k1 to make k2 the oldest
-        cache.get_or_reconstruct(k1, Some(&mk_base(k1, 0)), Some(&mk_head(k1, 0)), &[]).unwrap();
+        cache
+            .get_or_reconstruct(k1, Some(&mk_base(k1, 0)), Some(&mk_head(k1, 0)), &[])
+            .unwrap();
 
         // Insert k4 -> should evict k2 (oldest LRU entry)
-        cache.get_or_reconstruct(k4, Some(&mk_base(k4, 3)), Some(&mk_head(k4, 3)), &[]).unwrap();
+        cache
+            .get_or_reconstruct(k4, Some(&mk_base(k4, 3)), Some(&mk_head(k4, 3)), &[])
+            .unwrap();
 
         assert_eq!(cache.cached_frame_count(1), 3);
         assert_eq!(cache.metrics().evictions_lru, 1);
@@ -610,8 +631,12 @@ mod tests {
         };
 
         // Insert k1 and k2
-        cache.get_or_reconstruct(k1, Some(&mk_base(k1, 0)), Some(&mk_head(k1, 0)), &[]).unwrap();
-        cache.get_or_reconstruct(k2, Some(&mk_base(k2, 1)), Some(&mk_head(k2, 1)), &[]).unwrap();
+        cache
+            .get_or_reconstruct(k1, Some(&mk_base(k1, 0)), Some(&mk_head(k1, 0)), &[])
+            .unwrap();
+        cache
+            .get_or_reconstruct(k2, Some(&mk_base(k2, 1)), Some(&mk_head(k2, 1)), &[])
+            .unwrap();
 
         // Pin k1 (oldest)
         assert!(cache.pin_chunk(k1));
@@ -619,10 +644,15 @@ mod tests {
         assert_eq!(cache.metrics().pinned_frames, 1);
 
         // Insert k3 -> would normally evict k1, but k1 is pinned, so k2 is evicted
-        cache.get_or_reconstruct(k3, Some(&mk_base(k3, 2)), Some(&mk_head(k3, 2)), &[]).unwrap();
+        cache
+            .get_or_reconstruct(k3, Some(&mk_base(k3, 2)), Some(&mk_head(k3, 2)), &[])
+            .unwrap();
 
         assert_eq!(cache.cached_frame_count(1), 2);
-        assert!(cache.is_chunk_pinned(k1), "Pinned chunk k1 must survive eviction");
+        assert!(
+            cache.is_chunk_pinned(k1),
+            "Pinned chunk k1 must survive eviction"
+        );
 
         // Unpin k1
         assert!(cache.unpin_chunk(k1));
@@ -694,7 +724,10 @@ mod tests {
         let p_ahead = calculate_movement_predicted_priority(10, 15, px, pz, 0.0, 5.0, 1.0);
         let p_behind = calculate_movement_predicted_priority(10, 5, px, pz, 0.0, 5.0, 1.0);
 
-        assert!(p_ahead < p_behind, "Chunk in front of moving player must have higher priority (lower score)");
+        assert!(
+            p_ahead < p_behind,
+            "Chunk in front of moving player must have higher priority (lower score)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -743,7 +776,10 @@ mod tests {
         encoded[5] = 99;
 
         let res = SolarChunkEnvelope::decode(&encoded);
-        assert!(matches!(res, Err(SolarCodecError::UnsupportedVersion { version: 99 })));
+        assert!(matches!(
+            res,
+            Err(SolarCodecError::UnsupportedVersion { version: 99 })
+        ));
     }
 
     #[test]
@@ -821,5 +857,290 @@ mod tests {
         drop(handle_clone);
         assert_eq!(handle.strong_count(), 1);
     }
-}
 
+    #[test]
+    fn test_codec_boundary_coords_and_keys() {
+        let payload = vec![0x00];
+        let max_world_key = u64::MAX;
+        let max_x = i32::MAX;
+        let min_z = i32::MIN;
+        let envelope =
+            SolarChunkEnvelope::new(max_world_key, max_x, min_z, 0, 0, payload.clone()).unwrap();
+        let encoded = envelope.encode();
+        let decoded = SolarChunkEnvelope::decode(&encoded).unwrap();
+        assert_eq!(decoded.world_key, max_world_key);
+        assert_eq!(decoded.chunk_x, max_x);
+        assert_eq!(decoded.chunk_z, min_z);
+    }
+
+    #[test]
+    fn test_stable_canonical_fold() {
+        let chunk_key = pack_chunk_key(1, 0, 0);
+        let frame1 = SolarChunkFrame {
+            chunk_key,
+            world_key: 1,
+            chunk_x: 0,
+            chunk_z: 0,
+            applied_revision: 2,
+            base_revision: 0,
+            base_data: vec![0x11, 0x22],
+            ordered_patches: vec![SolarChunkPatchFrame {
+                revision: 1,
+                edits: vec![SolarBlockEdit::new(0, 64, 0, 10)],
+                actor: "player".to_string(),
+            }],
+        };
+        let frame2 = frame1.clone();
+
+        let folded1 = fold_chunk_frame(&frame1).unwrap();
+        let folded2 = fold_chunk_frame(&frame2).unwrap();
+
+        assert_eq!(folded1.data, folded2.data);
+    }
+
+    // -----------------------------------------------------------------------
+    // Revision & Crash Recovery Acceptance Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_one_revision_per_accepted_write() {
+        let mut manager = SolarRecoveryManager::new();
+        let t0 = Timestamp::from_micros_since_unix_epoch(1000);
+        let chunk_key = manager
+            .initialize_chunk(1, 0, 0, vec![0x10, 0x20], t0)
+            .unwrap();
+
+        assert_eq!(manager.head_revision(chunk_key), Some(0));
+
+        // Write 1
+        manager
+            .stage_mutation(
+                101,
+                chunk_key,
+                0,
+                vec![SolarBlockEdit::new(0, 64, 0, 1)],
+                "alice".to_string(),
+                t0,
+            )
+            .unwrap();
+        let receipt1 = manager.acknowledge_mutation(101, t0).unwrap();
+        assert_eq!(receipt1.committed_revision, 1);
+        assert_eq!(manager.head_revision(chunk_key), Some(1));
+
+        // Write 2
+        manager
+            .stage_mutation(
+                102,
+                chunk_key,
+                1,
+                vec![SolarBlockEdit::new(1, 64, 1, 2)],
+                "bob".to_string(),
+                t0,
+            )
+            .unwrap();
+        let receipt2 = manager.acknowledge_mutation(102, t0).unwrap();
+        assert_eq!(receipt2.committed_revision, 2);
+        assert_eq!(manager.head_revision(chunk_key), Some(2));
+
+        // Write 3
+        manager
+            .stage_mutation(
+                103,
+                chunk_key,
+                2,
+                vec![SolarBlockEdit::new(2, 64, 2, 3)],
+                "carol".to_string(),
+                t0,
+            )
+            .unwrap();
+        let receipt3 = manager.acknowledge_mutation(103, t0).unwrap();
+        assert_eq!(receipt3.committed_revision, 3);
+        assert_eq!(manager.head_revision(chunk_key), Some(3));
+
+        // Verify frame reflects exactly 3 revisions
+        let frame = manager.read_chunk_frame(chunk_key, None).unwrap();
+        assert_eq!(frame.applied_revision, 3);
+        assert_eq!(frame.ordered_patches.len(), 3);
+        assert_eq!(frame.ordered_patches[0].revision, 1);
+        assert_eq!(frame.ordered_patches[1].revision, 2);
+        assert_eq!(frame.ordered_patches[2].revision, 3);
+    }
+
+    #[test]
+    fn test_crash_before_ack_commits_nothing() {
+        let mut manager = SolarRecoveryManager::new();
+        let t0 = Timestamp::from_micros_since_unix_epoch(1000);
+        let chunk_key = manager
+            .initialize_chunk(1, 0, 0, vec![0xAA, 0xBB], t0)
+            .unwrap();
+
+        // Stage 3 mutations
+        manager
+            .stage_mutation(
+                201,
+                chunk_key,
+                0,
+                vec![SolarBlockEdit::new(0, 64, 0, 1)],
+                "alice".to_string(),
+                t0,
+            )
+            .unwrap();
+
+        assert_eq!(manager.pending_staged_count(), 1);
+        assert_eq!(manager.head_revision(chunk_key), Some(0));
+
+        // Simulate crash before ACK is received
+        let restart_summary = manager.simulate_crash_and_restart();
+        assert_eq!(restart_summary.discarded_unacknowledged_mutations, 1);
+        assert_eq!(restart_summary.recovered_acknowledged_mutations, 0);
+
+        // Verify chunk remains strictly at revision 0 with zero committed patches
+        assert_eq!(manager.head_revision(chunk_key), Some(0));
+        assert_eq!(manager.pending_staged_count(), 0);
+        assert_eq!(manager.committed_count(), 0);
+
+        let frame = manager.read_chunk_frame(chunk_key, None).unwrap();
+        assert_eq!(frame.applied_revision, 0);
+        assert_eq!(frame.ordered_patches.len(), 0);
+
+        // Re-attempting ACK on discarded unacknowledged mutation fails
+        let ack_res = manager.acknowledge_mutation(201, t0);
+        assert!(matches!(
+            ack_res,
+            Err(SolarRecoveryError::UnacknowledgedMutationDropped { .. })
+        ));
+    }
+
+    #[test]
+    fn test_crash_after_ack_recovers_once() {
+        let mut manager = SolarRecoveryManager::new();
+        let t0 = Timestamp::from_micros_since_unix_epoch(1000);
+        let chunk_key = manager
+            .initialize_chunk(1, 0, 0, vec![0xCA, 0xFE], t0)
+            .unwrap();
+
+        // Stage & ACK mutation 1
+        manager
+            .stage_mutation(
+                301,
+                chunk_key,
+                0,
+                vec![SolarBlockEdit::new(5, 64, 5, 10)],
+                "alice".to_string(),
+                t0,
+            )
+            .unwrap();
+        let receipt1 = manager.acknowledge_mutation(301, t0).unwrap();
+        assert_eq!(receipt1.committed_revision, 1);
+
+        // Stage mutation 2 (unacknowledged)
+        manager
+            .stage_mutation(
+                302,
+                chunk_key,
+                1,
+                vec![SolarBlockEdit::new(6, 64, 6, 20)],
+                "bob".to_string(),
+                t0,
+            )
+            .unwrap();
+
+        // Crash happens: mutation 1 was ACKed, mutation 2 was un-ACKed
+        let summary = manager.simulate_crash_and_restart();
+        assert_eq!(summary.discarded_unacknowledged_mutations, 1);
+        assert_eq!(summary.recovered_acknowledged_mutations, 1);
+
+        // Replay and state verification
+        assert_eq!(manager.head_revision(chunk_key), Some(1));
+        let frame = manager.read_chunk_frame(chunk_key, None).unwrap();
+        assert_eq!(frame.applied_revision, 1);
+        assert_eq!(frame.ordered_patches.len(), 1);
+        assert_eq!(frame.ordered_patches[0].revision, 1);
+        assert_eq!(frame.ordered_patches[0].edits[0].state, 10);
+
+        // Duplicate staging of already acknowledged mutation is rejected
+        let dup_res = manager.stage_mutation(
+            301,
+            chunk_key,
+            1,
+            vec![SolarBlockEdit::new(5, 64, 5, 10)],
+            "alice".to_string(),
+            t0,
+        );
+        assert!(matches!(
+            dup_res,
+            Err(SolarRecoveryError::DuplicateMutationId { .. })
+        ));
+    }
+
+    #[test]
+    fn test_stale_and_gap_reads_fail_closed() {
+        let mut manager = SolarRecoveryManager::new();
+        let t0 = Timestamp::from_micros_since_unix_epoch(1000);
+        let chunk_key = manager
+            .initialize_chunk(1, 0, 0, vec![0x01, 0x02], t0)
+            .unwrap();
+
+        // Commit revisions 1, 2, 3
+        for rev in 1..=3 {
+            manager
+                .stage_mutation(
+                    400 + rev,
+                    chunk_key,
+                    rev - 1,
+                    vec![SolarBlockEdit::new(0, (60 + rev) as i16, 0, rev as i32)],
+                    "tester".to_string(),
+                    t0,
+                )
+                .unwrap();
+            manager.acknowledge_mutation(400 + rev, t0).unwrap();
+        }
+
+        assert_eq!(manager.head_revision(chunk_key), Some(3));
+
+        // 1. Reading unknown chunk fails closed
+        let not_found_key = pack_chunk_key(999, 10, 10);
+        assert!(matches!(
+            manager.read_chunk_frame(not_found_key, None),
+            Err(SolarRecoveryError::NotFound { .. })
+        ));
+
+        // 2. Requesting future generation fails closed
+        assert!(matches!(
+            manager.read_chunk_frame(chunk_key, Some(10)),
+            Err(SolarRecoveryError::StaleGeneration { .. })
+        ));
+
+        // 3. Inject revision gap (delete revision 2) -> read fails closed
+        assert!(manager.inject_revision_gap(chunk_key, 2));
+        assert!(matches!(
+            manager.read_chunk_frame(chunk_key, None),
+            Err(SolarRecoveryError::RevisionGap {
+                expected_revision: 2,
+                found_revision: 3,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_deterministic_replay_and_checksum_consistency() {
+        let edits_1 = vec![SolarBlockEdit::new(0, 64, 0, 1)];
+        let edits_2 = vec![SolarBlockEdit::new(1, 64, 1, 2)];
+        let batches = vec![edits_1, edits_2];
+        let base_bytes = vec![0x12, 0x34, 0x56, 0x78];
+
+        let replay_1 =
+            SolarReplayRunner::replay_sequence(1, 0, 0, &base_bytes, &batches).unwrap();
+        let replay_2 =
+            SolarReplayRunner::replay_sequence(1, 0, 0, &base_bytes, &batches).unwrap();
+
+        assert_eq!(replay_1.revision, 2);
+        assert_eq!(replay_1.folded_patch_count, 2);
+        assert_eq!(replay_1.data, replay_2.data);
+
+        let checksum1 = crate::codec::calculate_checksum(&replay_1.data);
+        let checksum2 = crate::codec::calculate_checksum(&replay_2.data);
+        assert_eq!(checksum1, checksum2);
+    }
+}

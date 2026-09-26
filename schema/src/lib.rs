@@ -35,7 +35,7 @@
 //! ```
 //! This provides O(1) primary-key lookups directly in SpacetimeDB and in client-side SDK caches.
 
-use spacetimedb::{table, Timestamp};
+use spacetimedb::{Timestamp, table};
 
 /// Maximum block edits allowed in a single `solar_chunk_patch` batch.
 pub const MAX_EDITS_PER_PATCH: usize = 256;
@@ -159,8 +159,17 @@ impl SolarBlockEdit {
     }
 }
 
-/// Authorization context passed to Solar mutation reducers.
+/// Input struct for batch base chunk commits (`solar_chunk_base_commit_batch`).
 #[derive(Clone, Debug, PartialEq, Eq, spacetimedb::SpacetimeType)]
+pub struct SolarChunkBaseInput {
+    pub chunk_x: i32,
+    pub chunk_z: i32,
+    pub data: Vec<u8>,
+    pub base_revision: u64,
+}
+
+/// Authorization context passed to Solar mutation reducers.
+#[derive(Clone, Debug, Default, PartialEq, Eq, spacetimedb::SpacetimeType)]
 pub struct SolarAuthContext {
     /// Player UUID or system identity making the edit.
     pub actor: String,
@@ -172,32 +181,46 @@ pub struct SolarAuthContext {
     pub client_tick: u64,
 }
 
-impl Default for SolarAuthContext {
-    fn default() -> Self {
-        Self {
-            actor: String::new(),
-            is_admin: false,
-            bypass_claims: false,
-            client_tick: 0,
-        }
-    }
-}
-
 /// Explicit authorization error types for Solar mutations.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SolarAuthError {
-    RegionDenied { region_name: String, reason: String },
-    BlockBehaviorForbidden { block_state: i32, reason: String },
-    ContainerAccessDenied { container_type: String, reason: String },
-    Unauthenticated { reason: String },
-    InvalidCoordinates { x: i32, y: i32, z: i32, reason: String },
-    RevisionConflict { expected: u64, actual: u64 },
-    WorldNotActive { world_key: u64, status: String },
-    WorldInFallback { world_key: u64 },
+    RegionDenied {
+        region_name: String,
+        reason: String,
+    },
+    BlockBehaviorForbidden {
+        block_state: i32,
+        reason: String,
+    },
+    ContainerAccessDenied {
+        container_type: String,
+        reason: String,
+    },
+    Unauthenticated {
+        reason: String,
+    },
+    InvalidCoordinates {
+        x: i32,
+        y: i32,
+        z: i32,
+        reason: String,
+    },
+    RevisionConflict {
+        expected: u64,
+        actual: u64,
+    },
+    WorldNotActive {
+        world_key: u64,
+        status: String,
+    },
+    WorldInFallback {
+        world_key: u64,
+    },
 }
 
 /// RegionManager authorization hook interface.
 pub trait RegionManagerAuthorizer {
+    #[allow(clippy::too_many_arguments)]
     fn authorize_edit(
         &self,
         world_key: u64,
@@ -212,6 +235,7 @@ pub trait RegionManagerAuthorizer {
 
 /// BlockBehavior authorization hook interface.
 pub trait BlockBehaviorAuthorizer {
+    #[allow(clippy::too_many_arguments)]
     fn authorize_state_change(
         &self,
         world_key: u64,
@@ -301,7 +325,11 @@ impl SolarWorld {
     /// Returns the monotonic import progress percentage (0..=100).
     pub fn progress_pct(&self) -> u32 {
         if self.total_chunks == 0 {
-            if self.status == WORLD_STATUS_ACTIVE { 100 } else { 0 }
+            if self.status == WORLD_STATUS_ACTIVE {
+                100
+            } else {
+                0
+            }
         } else {
             let pct = ((self.completed_chunks as u64 * 100) / (self.total_chunks as u64)) as u32;
             pct.min(100)
@@ -461,9 +489,7 @@ pub fn validate_world_lifecycle_transition(
         (Some(c), t) => Err(format!(
             "invalid world lifecycle transition from '{c}' to '{t}'"
         )),
-        (None, t) => Err(format!(
-            "cannot initialize world directly in state '{t}'"
-        )),
+        (None, t) => Err(format!("cannot initialize world directly in state '{t}'")),
     }
 }
 
@@ -509,7 +535,10 @@ pub fn evaluate_compaction_lease_acquire(
             // Expired lease can be reclaimed
             Ok(())
         } else {
-            Err("compaction lease conflict: another worker actively holds an unexpired lease".to_string())
+            Err(
+                "compaction lease conflict: another worker actively holds an unexpired lease"
+                    .to_string(),
+            )
         }
     } else {
         Err(format!("unknown compaction status '{current_status}'"))
@@ -627,39 +656,79 @@ pub fn validate_compaction_bounds(
 #[cfg(not(target_arch = "wasm32"))]
 mod host_stubs {
     #[unsafe(no_mangle)]
-    pub extern "C" fn index_id_from_name(_: *const u8, _: usize) -> u32 { 0 }
+    pub extern "C" fn index_id_from_name(_: *const u8, _: usize) -> u32 {
+        0
+    }
     #[unsafe(no_mangle)]
     pub extern "C" fn bytes_sink_write(_: *const u8, _: usize) {}
     #[unsafe(no_mangle)]
-    pub extern "C" fn bytes_source_remaining_length() -> usize { 0 }
+    pub extern "C" fn bytes_source_remaining_length() -> usize {
+        0
+    }
     #[unsafe(no_mangle)]
-    pub extern "C" fn bytes_source_read(_: *mut u8, _: usize) -> usize { 0 }
+    pub extern "C" fn bytes_source_read(_: *mut u8, _: usize) -> usize {
+        0
+    }
     #[unsafe(no_mangle)]
     pub extern "C" fn procedure_sleep_until(_: u64) {}
     #[unsafe(no_mangle)]
-    pub extern "C" fn console_timer_start(_: *const u8, _: usize) -> u32 { 0 }
+    pub extern "C" fn console_timer_start(_: *const u8, _: usize) -> u32 {
+        0
+    }
     #[unsafe(no_mangle)]
     pub extern "C" fn console_log(_: u32, _: *const u8, _: usize) {}
     #[unsafe(no_mangle)]
-    pub extern "C" fn table_id_from_name(_: *const u8, _: usize) -> u32 { 0 }
+    pub extern "C" fn table_id_from_name(_: *const u8, _: usize) -> u32 {
+        0
+    }
     #[unsafe(no_mangle)]
-    pub extern "C" fn get_jwt(_: *mut u8, _: usize) -> usize { 0 }
+    pub extern "C" fn get_jwt(_: *mut u8, _: usize) -> usize {
+        0
+    }
     #[unsafe(no_mangle)]
     pub extern "C" fn identity(_: *mut u8) {}
     #[unsafe(no_mangle)]
     pub extern "C" fn console_timer_end(_: u32) {}
     #[unsafe(no_mangle)]
-    pub extern "C" fn datastore_table_scan_bsatn(_: u32) -> u32 { 0 }
+    pub extern "C" fn datastore_table_scan_bsatn(_: u32) -> u32 {
+        0
+    }
     #[unsafe(no_mangle)]
-    pub extern "C" fn datastore_index_scan_point_bsatn(_: u32, _: *const u8, _: usize) -> u32 { 0 }
+    pub extern "C" fn datastore_index_scan_point_bsatn(_: u32, _: *const u8, _: usize) -> u32 {
+        0
+    }
     #[unsafe(no_mangle)]
-    pub extern "C" fn datastore_index_scan_range_bsatn(_: u32, _: *const u8, _: usize, _: *const u8, _: usize) -> u32 { 0 }
+    pub extern "C" fn datastore_index_scan_range_bsatn(
+        _: u32,
+        _: *const u8,
+        _: usize,
+        _: *const u8,
+        _: usize,
+    ) -> u32 {
+        0
+    }
     #[unsafe(no_mangle)]
-    pub extern "C" fn datastore_delete_by_index_scan_point_bsatn(_: u32, _: *const u8, _: usize) -> u32 { 0 }
+    pub extern "C" fn datastore_delete_by_index_scan_point_bsatn(
+        _: u32,
+        _: *const u8,
+        _: usize,
+    ) -> u32 {
+        0
+    }
     #[unsafe(no_mangle)]
-    pub extern "C" fn datastore_delete_by_index_scan_range_bsatn(_: u32, _: *const u8, _: usize, _: *const u8, _: usize) -> u32 { 0 }
+    pub extern "C" fn datastore_delete_by_index_scan_range_bsatn(
+        _: u32,
+        _: *const u8,
+        _: usize,
+        _: *const u8,
+        _: usize,
+    ) -> u32 {
+        0
+    }
     #[unsafe(no_mangle)]
-    pub extern "C" fn row_iter_bsatn_advance(_: u32) -> u32 { 0 }
+    pub extern "C" fn row_iter_bsatn_advance(_: u32) -> u32 {
+        0
+    }
     #[unsafe(no_mangle)]
     pub extern "C" fn row_iter_bsatn_close(_: u32) {}
 }
@@ -688,9 +757,18 @@ mod tests {
         for (world_key, chunk_x, chunk_z) in test_cases {
             let packed = pack_chunk_key(world_key, chunk_x, chunk_z);
             let (unpacked_world, unpacked_x, unpacked_z) = unpack_chunk_key(packed);
-            assert_eq!(unpacked_world, world_key, "world_key mismatch for ({world_key}, {chunk_x}, {chunk_z})");
-            assert_eq!(unpacked_x, chunk_x, "chunk_x mismatch for ({world_key}, {chunk_x}, {chunk_z})");
-            assert_eq!(unpacked_z, chunk_z, "chunk_z mismatch for ({world_key}, {chunk_x}, {chunk_z})");
+            assert_eq!(
+                unpacked_world, world_key,
+                "world_key mismatch for ({world_key}, {chunk_x}, {chunk_z})"
+            );
+            assert_eq!(
+                unpacked_x, chunk_x,
+                "chunk_x mismatch for ({world_key}, {chunk_x}, {chunk_z})"
+            );
+            assert_eq!(
+                unpacked_z, chunk_z,
+                "chunk_z mismatch for ({world_key}, {chunk_x}, {chunk_z})"
+            );
         }
     }
 
@@ -803,7 +881,11 @@ mod tests {
         // Chunk has no head yet, expecting non-zero -> rejects
         let invalid_initial = check_expected_revision(None, 1);
         assert!(invalid_initial.is_err());
-        assert!(invalid_initial.unwrap_err().contains("chunk head does not exist"));
+        assert!(
+            invalid_initial
+                .unwrap_err()
+                .contains("chunk head does not exist")
+        );
     }
 
     #[test]
@@ -915,14 +997,18 @@ mod tests {
             bypass_claims: true,
             client_tick: 101,
         };
-        assert!(region_mgr
-            .authorize_edit(1, "world", 50, 64, 50, "admin_1", &admin_auth)
-            .is_ok());
+        assert!(
+            region_mgr
+                .authorize_edit(1, "world", 50, 64, 50, "admin_1", &admin_auth)
+                .is_ok()
+        );
 
         // Player editing outside safezone -> Allowed
-        assert!(region_mgr
-            .authorize_edit(1, "world", 500, 64, 500, "player_1", &player_auth)
-            .is_ok());
+        assert!(
+            region_mgr
+                .authorize_edit(1, "world", 500, 64, 500, "player_1", &player_auth)
+                .is_ok()
+        );
 
         // Player attempting forbidden block state -> Denied
         let forbidden_state =
@@ -933,9 +1019,11 @@ mod tests {
         ));
 
         // Player placing valid state -> Allowed
-        assert!(block_behavior
-            .authorize_state_change(1, 500, 64, 500, 1, "player_1", &player_auth)
-            .is_ok());
+        assert!(
+            block_behavior
+                .authorize_state_change(1, 500, 64, 500, 1, "player_1", &player_auth)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -950,10 +1038,8 @@ mod tests {
         let chunk_key = pack_chunk_key(world_key, chunk_x, chunk_z);
 
         // Attempt commit with wrong expected revision (expected = 5 on new chunk) -> Atomic Rejection
-        let conflict = check_expected_revision(
-            current_head.as_ref().map(|h| h.applied_revision),
-            5,
-        );
+        let conflict =
+            check_expected_revision(current_head.as_ref().map(|h| h.applied_revision), 5);
         assert!(conflict.is_err());
         assert_eq!(
             current_head.as_ref().map(|h| h.applied_revision),
@@ -962,11 +1048,8 @@ mod tests {
         );
 
         // Successful commit at expected = 0 -> Advances to rev 1
-        let next_rev = check_expected_revision(
-            current_head.as_ref().map(|h| h.applied_revision),
-            0,
-        )
-        .unwrap();
+        let next_rev =
+            check_expected_revision(current_head.as_ref().map(|h| h.applied_revision), 0).unwrap();
         assert_eq!(next_rev, 1);
         patch_count += 1;
         current_head = Some(SolarChunkHead {
@@ -982,11 +1065,8 @@ mod tests {
         });
 
         // Step 2: Second edit expecting rev 1 -> Advances to rev 2
-        let next_rev = check_expected_revision(
-            current_head.as_ref().map(|h| h.applied_revision),
-            1,
-        )
-        .unwrap();
+        let next_rev =
+            check_expected_revision(current_head.as_ref().map(|h| h.applied_revision), 1).unwrap();
         assert_eq!(next_rev, 2);
         patch_count += 1;
         {
@@ -996,10 +1076,8 @@ mod tests {
         }
 
         // Step 3: Concurrent edit sending stale expected rev 1 when current head is 2 -> Atomic Rejection
-        let stale_rejection = check_expected_revision(
-            current_head.as_ref().map(|h| h.applied_revision),
-            1,
-        );
+        let stale_rejection =
+            check_expected_revision(current_head.as_ref().map(|h| h.applied_revision), 1);
         assert!(stale_rejection.is_err());
         assert_eq!(current_head.as_ref().unwrap().applied_revision, 2);
 
@@ -1055,9 +1133,18 @@ mod tests {
             }
         }
 
-        assert_eq!(success_count, 1, "Exactly one concurrent worker must succeed");
-        assert_eq!(conflict_count, 3, "All other concurrent workers must fail with revision conflict");
-        assert_eq!(head.applied_revision, 6, "Head must advance exactly once to revision 6");
+        assert_eq!(
+            success_count, 1,
+            "Exactly one concurrent worker must succeed"
+        );
+        assert_eq!(
+            conflict_count, 3,
+            "All other concurrent workers must fail with revision conflict"
+        );
+        assert_eq!(
+            head.applied_revision, 6,
+            "Head must advance exactly once to revision 6"
+        );
         assert_eq!(head.patch_count, 6);
         assert_eq!(head.last_actor, "worker_A");
         assert_eq!(patch_log.len(), 1);
@@ -1108,7 +1195,10 @@ mod tests {
 
         // Compaction executes for cutoff revision = 3
         let cutoff_revision = 3u64;
-        assert!(validate_compaction_bounds(head.base_revision, head.applied_revision, cutoff_revision).is_ok());
+        assert!(
+            validate_compaction_bounds(head.base_revision, head.applied_revision, cutoff_revision)
+                .is_ok()
+        );
 
         // 1. Base snapshot is updated
         base.data = vec![0xAA, 0xBB, 0xCC]; // newly folded compressed chunk
@@ -1122,7 +1212,11 @@ mod tests {
         head.patch_count = patches.len() as u32;
 
         // Verify that newer patches (revisions 4 and 5) were NOT discarded
-        assert_eq!(patches.len(), 2, "Patches 4 and 5 must remain in the patch table");
+        assert_eq!(
+            patches.len(),
+            2,
+            "Patches 4 and 5 must remain in the patch table"
+        );
         assert_eq!(patches[0].revision, 4);
         assert_eq!(patches[1].revision, 5);
         assert_eq!(head.base_revision, 3);
@@ -1157,19 +1251,17 @@ mod tests {
             updated_at: Timestamp::from_micros_since_unix_epoch(1),
         };
 
-        let initial_patches = vec![
-            SolarChunkPatch {
-                id: 1,
-                chunk_key,
-                world_key: 1,
-                chunk_x: 0,
-                chunk_z: 0,
-                revision: 1,
-                edits: vec![SolarBlockEdit::new(0, 64, 0, 1)],
-                actor: "valid_actor".to_string(),
-                created_at: Timestamp::from_micros_since_unix_epoch(10),
-            },
-        ];
+        let initial_patches = vec![SolarChunkPatch {
+            id: 1,
+            chunk_key,
+            world_key: 1,
+            chunk_x: 0,
+            chunk_z: 0,
+            revision: 1,
+            edits: vec![SolarBlockEdit::new(0, 64, 0, 1)],
+            actor: "valid_actor".to_string(),
+            created_at: Timestamp::from_micros_since_unix_epoch(10),
+        }];
 
         let region_mgr = MockRegionManager {
             safezones: vec![(0, -64, 0, 100, 320, 100)],
@@ -1192,9 +1284,18 @@ mod tests {
         let current_base = initial_base.clone();
         let current_patches = initial_patches.clone();
 
-        assert_eq!(current_head, initial_head, "Head must be completely unchanged");
-        assert_eq!(current_base, initial_base, "Base must be completely unchanged");
-        assert_eq!(current_patches, initial_patches, "Patch log must be completely unchanged");
+        assert_eq!(
+            current_head, initial_head,
+            "Head must be completely unchanged"
+        );
+        assert_eq!(
+            current_base, initial_base,
+            "Base must be completely unchanged"
+        );
+        assert_eq!(
+            current_patches, initial_patches,
+            "Patch log must be completely unchanged"
+        );
     }
 
     #[test]
@@ -1240,7 +1341,10 @@ mod tests {
 
         for chunk in &src_base_chunks {
             let dst_chunk_key = pack_chunk_key(dst_world_key, chunk.chunk_x, chunk.chunk_z);
-            assert_ne!(dst_chunk_key, chunk.chunk_key, "Destination chunk key must differ from source");
+            assert_ne!(
+                dst_chunk_key, chunk.chunk_key,
+                "Destination chunk key must differ from source"
+            );
 
             dst_base_chunks.push(SolarChunkBase {
                 chunk_key: dst_chunk_key,
@@ -1275,8 +1379,14 @@ mod tests {
         }
 
         // Verify source chunks are completely unmodified
-        assert_eq!(src_base_chunks, snapshot_src_base, "Source base chunks must not be modified");
-        assert_eq!(src_heads, snapshot_src_heads, "Source heads must not be modified");
+        assert_eq!(
+            src_base_chunks, snapshot_src_base,
+            "Source base chunks must not be modified"
+        );
+        assert_eq!(
+            src_heads, snapshot_src_heads,
+            "Source heads must not be modified"
+        );
     }
 
     #[test]
@@ -1294,9 +1404,18 @@ mod tests {
             let key = pack_chunk_key(world_key, cx, cz);
             let (unpacked_world, unpacked_x, unpacked_z) = unpack_chunk_key(key);
 
-            assert_eq!(unpacked_world, world_key, "world_key must roundtrip exactly");
-            assert_eq!(unpacked_x, cx, "negative/boundary chunk_x must roundtrip exactly");
-            assert_eq!(unpacked_z, cz, "negative/boundary chunk_z must roundtrip exactly");
+            assert_eq!(
+                unpacked_world, world_key,
+                "world_key must roundtrip exactly"
+            );
+            assert_eq!(
+                unpacked_x, cx,
+                "negative/boundary chunk_x must roundtrip exactly"
+            );
+            assert_eq!(
+                unpacked_z, cz,
+                "negative/boundary chunk_z must roundtrip exactly"
+            );
 
             // Local block conversion inside negative chunk
             let edit = SolarBlockEdit::new(15, 64, 15, 1);
@@ -1330,7 +1449,11 @@ mod tests {
         oversized.push(SolarBlockEdit::new(0, 0, 0, 1));
         let res_oversized = validate_patch_bounds(&oversized, world_min_y, world_height);
         assert!(res_oversized.is_err());
-        assert!(res_oversized.unwrap_err().contains("exceeds maximum batch limit"));
+        assert!(
+            res_oversized
+                .unwrap_err()
+                .contains("exceeds maximum batch limit")
+        );
 
         // 3. Local coordinate bounds (x >= 16 or z >= 16 rejected)
         let bad_local_x = vec![SolarBlockEdit::new(16, 0, 0, 1)];
@@ -1341,14 +1464,42 @@ mod tests {
 
         // 4. World height boundary validation
         // Exact lower bound: -64 (valid)
-        assert!(validate_patch_bounds(&[SolarBlockEdit::new(0, -64, 0, 1)], world_min_y, world_height).is_ok());
+        assert!(
+            validate_patch_bounds(
+                &[SolarBlockEdit::new(0, -64, 0, 1)],
+                world_min_y,
+                world_height
+            )
+            .is_ok()
+        );
         // Below lower bound: -65 (invalid)
-        assert!(validate_patch_bounds(&[SolarBlockEdit::new(0, -65, 0, 1)], world_min_y, world_height).is_err());
+        assert!(
+            validate_patch_bounds(
+                &[SolarBlockEdit::new(0, -65, 0, 1)],
+                world_min_y,
+                world_height
+            )
+            .is_err()
+        );
 
         // Exact upper bound: 319 (valid)
-        assert!(validate_patch_bounds(&[SolarBlockEdit::new(0, 319, 0, 1)], world_min_y, world_height).is_ok());
+        assert!(
+            validate_patch_bounds(
+                &[SolarBlockEdit::new(0, 319, 0, 1)],
+                world_min_y,
+                world_height
+            )
+            .is_ok()
+        );
         // At/above upper bound: 320 (invalid)
-        assert!(validate_patch_bounds(&[SolarBlockEdit::new(0, 320, 0, 1)], world_min_y, world_height).is_err());
+        assert!(
+            validate_patch_bounds(
+                &[SolarBlockEdit::new(0, 320, 0, 1)],
+                world_min_y,
+                world_height
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1356,21 +1507,60 @@ mod tests {
         // Valid forward transitions
         assert!(validate_world_lifecycle_transition(None, WORLD_STATUS_IMPORTING).is_ok());
         assert!(validate_world_lifecycle_transition(None, WORLD_STATUS_ACTIVE).is_ok());
-        assert!(validate_world_lifecycle_transition(Some(WORLD_STATUS_IMPORTING), WORLD_STATUS_ACTIVE).is_ok());
-        assert!(validate_world_lifecycle_transition(Some(WORLD_STATUS_IMPORTING), WORLD_STATUS_FAILED).is_ok());
-        assert!(validate_world_lifecycle_transition(Some(WORLD_STATUS_ACTIVE), WORLD_STATUS_FALLBACK).is_ok());
-        assert!(validate_world_lifecycle_transition(Some(WORLD_STATUS_FALLBACK), WORLD_STATUS_ACTIVE).is_ok());
-        assert!(validate_world_lifecycle_transition(Some(WORLD_STATUS_FAILED), WORLD_STATUS_IMPORTING).is_ok());
+        assert!(
+            validate_world_lifecycle_transition(Some(WORLD_STATUS_IMPORTING), WORLD_STATUS_ACTIVE)
+                .is_ok()
+        );
+        assert!(
+            validate_world_lifecycle_transition(Some(WORLD_STATUS_IMPORTING), WORLD_STATUS_FAILED)
+                .is_ok()
+        );
+        assert!(
+            validate_world_lifecycle_transition(Some(WORLD_STATUS_ACTIVE), WORLD_STATUS_FALLBACK)
+                .is_ok()
+        );
+        assert!(
+            validate_world_lifecycle_transition(Some(WORLD_STATUS_FALLBACK), WORLD_STATUS_ACTIVE)
+                .is_ok()
+        );
+        assert!(
+            validate_world_lifecycle_transition(Some(WORLD_STATUS_FAILED), WORLD_STATUS_IMPORTING)
+                .is_ok()
+        );
 
         // Idempotent re-assertions
-        assert!(validate_world_lifecycle_transition(Some(WORLD_STATUS_ACTIVE), WORLD_STATUS_ACTIVE).is_ok());
-        assert!(validate_world_lifecycle_transition(Some(WORLD_STATUS_IMPORTING), WORLD_STATUS_IMPORTING).is_ok());
-        assert!(validate_world_lifecycle_transition(Some(WORLD_STATUS_FALLBACK), WORLD_STATUS_FALLBACK).is_ok());
+        assert!(
+            validate_world_lifecycle_transition(Some(WORLD_STATUS_ACTIVE), WORLD_STATUS_ACTIVE)
+                .is_ok()
+        );
+        assert!(
+            validate_world_lifecycle_transition(
+                Some(WORLD_STATUS_IMPORTING),
+                WORLD_STATUS_IMPORTING
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_world_lifecycle_transition(Some(WORLD_STATUS_FALLBACK), WORLD_STATUS_FALLBACK)
+                .is_ok()
+        );
 
         // Invalid transitions
-        assert!(validate_world_lifecycle_transition(Some(WORLD_STATUS_FAILED), WORLD_STATUS_ACTIVE).is_err());
-        assert!(validate_world_lifecycle_transition(Some(WORLD_STATUS_IMPORTING), WORLD_STATUS_FALLBACK).is_err());
-        assert!(validate_world_lifecycle_transition(Some(WORLD_STATUS_FALLBACK), WORLD_STATUS_FAILED).is_err());
+        assert!(
+            validate_world_lifecycle_transition(Some(WORLD_STATUS_FAILED), WORLD_STATUS_ACTIVE)
+                .is_err()
+        );
+        assert!(
+            validate_world_lifecycle_transition(
+                Some(WORLD_STATUS_IMPORTING),
+                WORLD_STATUS_FALLBACK
+            )
+            .is_err()
+        );
+        assert!(
+            validate_world_lifecycle_transition(Some(WORLD_STATUS_FALLBACK), WORLD_STATUS_FAILED)
+                .is_err()
+        );
         assert!(validate_world_lifecycle_transition(None, WORLD_STATUS_FALLBACK).is_err());
         assert!(validate_world_lifecycle_transition(None, WORLD_STATUS_FAILED).is_err());
     }
@@ -1416,7 +1606,10 @@ mod tests {
         let is_conflicting = world.status == WORLD_STATUS_ACTIVE
             && (world.harbor_revision != incoming_rev || world.harbor_checksum != conflicting_csum);
         assert!(is_conflicting);
-        assert_eq!(world.harbor_checksum, "sha256:abcd1234ef567890", "World state remains unmutated");
+        assert_eq!(
+            world.harbor_checksum, "sha256:abcd1234ef567890",
+            "World state remains unmutated"
+        );
     }
 
     #[test]
@@ -1459,8 +1652,12 @@ mod tests {
         head.last_actor = "actor_4".to_string();
 
         // Acknowledgement condition: head must match committed patch revision
-        let acknowledged = head.applied_revision == 4 && committed_patches.last().unwrap().revision == 4;
-        assert!(acknowledged, "Commit is acknowledged only after head revision advancement");
+        let acknowledged =
+            head.applied_revision == 4 && committed_patches.last().unwrap().revision == 4;
+        assert!(
+            acknowledged,
+            "Commit is acknowledged only after head revision advancement"
+        );
     }
 
     #[test]
@@ -1495,7 +1692,16 @@ mod tests {
 
         // 1. Initial pending request acquisition succeeds
         let initial_status = COMPACTION_STATUS_PENDING;
-        assert!(evaluate_compaction_lease_acquire(initial_status, Timestamp::from_micros_since_unix_epoch(0), Timestamp::from_micros_since_unix_epoch(0), 0, t0).is_ok());
+        assert!(
+            evaluate_compaction_lease_acquire(
+                initial_status,
+                Timestamp::from_micros_since_unix_epoch(0),
+                Timestamp::from_micros_since_unix_epoch(0),
+                0,
+                t0
+            )
+            .is_ok()
+        );
 
         let mut req = SolarCompactionRequest {
             chunk_key: pack_chunk_key(1, 0, 0),
@@ -1518,7 +1724,13 @@ mod tests {
 
         // 2. Concurrent worker attempts acquisition while lease is active (at 20s) -> Conflict rejected
         let t_active = Timestamp::from_micros_since_unix_epoch(20_000_000);
-        let conflict = evaluate_compaction_lease_acquire(&req.status, req.lease_expires_at, req.last_failed_at, req.backoff_micros, t_active);
+        let conflict = evaluate_compaction_lease_acquire(
+            &req.status,
+            req.lease_expires_at,
+            req.last_failed_at,
+            req.backoff_micros,
+            t_active,
+        );
         assert!(conflict.is_err());
         assert!(conflict.unwrap_err().contains("compaction lease conflict"));
 
@@ -1530,7 +1742,16 @@ mod tests {
 
         // 5. Abandoned worker recovery: time advances past 40s (at 45s) -> Acquisition succeeds
         let t_expired = Timestamp::from_micros_since_unix_epoch(45_000_000);
-        assert!(evaluate_compaction_lease_acquire(&req.status, req.lease_expires_at, req.last_failed_at, req.backoff_micros, t_expired).is_ok());
+        assert!(
+            evaluate_compaction_lease_acquire(
+                &req.status,
+                req.lease_expires_at,
+                req.last_failed_at,
+                req.backoff_micros,
+                t_expired
+            )
+            .is_ok()
+        );
 
         // Reclaim lease with next token
         req.lease_token = 2;
@@ -1547,13 +1768,28 @@ mod tests {
 
         // 7. Attempting immediate re-acquisition before backoff expires (at 47s) -> Backoff rejected
         let t_during_backoff = Timestamp::from_micros_since_unix_epoch(47_000_000);
-        let backoff_res = evaluate_compaction_lease_acquire(&req.status, req.lease_expires_at, req.last_failed_at, req.backoff_micros, t_during_backoff);
+        let backoff_res = evaluate_compaction_lease_acquire(
+            &req.status,
+            req.lease_expires_at,
+            req.last_failed_at,
+            req.backoff_micros,
+            t_during_backoff,
+        );
         assert!(backoff_res.is_err());
         assert!(backoff_res.unwrap_err().contains("backoff active"));
 
         // 8. Re-acquisition after backoff expires (at 51s) -> Acquisition succeeds
         let t_after_backoff = Timestamp::from_micros_since_unix_epoch(51_000_000);
-        assert!(evaluate_compaction_lease_acquire(&req.status, req.lease_expires_at, req.last_failed_at, req.backoff_micros, t_after_backoff).is_ok());
+        assert!(
+            evaluate_compaction_lease_acquire(
+                &req.status,
+                req.lease_expires_at,
+                req.last_failed_at,
+                req.backoff_micros,
+                t_after_backoff
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1585,7 +1821,10 @@ mod tests {
 
         // Mutation eligibility fails closed in FALLBACK mode
         let eligibility = validate_world_mutation_eligibility(&world);
-        assert_eq!(eligibility, Err(SolarAuthError::WorldInFallback { world_key: 100 }));
+        assert_eq!(
+            eligibility,
+            Err(SolarAuthError::WorldInFallback { world_key: 100 })
+        );
 
         // Revision & checksum remain unpolluted
         assert_eq!(world.harbor_revision, 999);
@@ -1602,7 +1841,10 @@ mod tests {
         let key_a = pack_chunk_key(world_a_key, cx, cz);
         let key_b = pack_chunk_key(world_b_key, cx, cz);
 
-        assert_ne!(key_a, key_b, "Packed chunk keys across distinct worlds must be unique");
+        assert_ne!(
+            key_a, key_b,
+            "Packed chunk keys across distinct worlds must be unique"
+        );
 
         // Verify unpacking separates worlds
         let (wa, xa, za) = unpack_chunk_key(key_a);
@@ -1669,7 +1911,10 @@ mod tests {
         // Enforces that empty or un-batched edits are rejected
         let empty_batch: Vec<SolarBlockEdit> = Vec::new();
         let res = validate_patch_bounds(&empty_batch, -64, 384);
-        assert!(res.is_err(), "Single-block / empty un-batched legacy writes are blocked");
+        assert!(
+            res.is_err(),
+            "Single-block / empty un-batched legacy writes are blocked"
+        );
     }
 
     struct MockContainerAuthorizer;
@@ -1706,10 +1951,15 @@ mod tests {
             client_tick: 1,
         };
 
-        let res_denied = container_auth.authorize_container_access(1, 99, 64, 99, "thief", &player_auth);
-        assert!(matches!(res_denied, Err(SolarAuthError::ContainerAccessDenied { .. })));
+        let res_denied =
+            container_auth.authorize_container_access(1, 99, 64, 99, "thief", &player_auth);
+        assert!(matches!(
+            res_denied,
+            Err(SolarAuthError::ContainerAccessDenied { .. })
+        ));
 
-        let res_allowed = container_auth.authorize_container_access(1, 10, 64, 10, "thief", &player_auth);
+        let res_allowed =
+            container_auth.authorize_container_access(1, 10, 64, 10, "thief", &player_auth);
         assert!(res_allowed.is_ok());
     }
 
@@ -1783,7 +2033,11 @@ mod tests {
 
         // Incoming identical chunk append during resume
         let incoming_data = vec![0x10, 0x20];
-        let is_resumable_match = existing_base.data == incoming_data && existing_base.base_revision == 0;
-        assert!(is_resumable_match, "Re-streaming existing base chunk on resume is idempotent");
+        let is_resumable_match =
+            existing_base.data == incoming_data && existing_base.base_revision == 0;
+        assert!(
+            is_resumable_match,
+            "Re-streaming existing base chunk on resume is idempotent"
+        );
     }
 }
